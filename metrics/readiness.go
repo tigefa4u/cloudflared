@@ -5,31 +5,32 @@ import (
 	"fmt"
 	"net/http"
 
-	conn "github.com/cloudflare/cloudflared/connection"
-	"github.com/cloudflare/cloudflared/tunnelstate"
+	"github.com/google/uuid"
 
-	"github.com/rs/zerolog"
+	"github.com/cloudflare/cloudflared/tunnelstate"
 )
 
 // ReadyServer serves HTTP 200 if the tunnel can serve traffic. Intended for k8s readiness checks.
 type ReadyServer struct {
-	tracker *tunnelstate.ConnTracker
+	clientID uuid.UUID
+	tracker  *tunnelstate.ConnTracker
 }
 
 // NewReadyServer initializes a ReadyServer and starts listening for dis/connection events.
-func NewReadyServer(log *zerolog.Logger) *ReadyServer {
+func NewReadyServer(
+	clientID uuid.UUID,
+	tracker *tunnelstate.ConnTracker,
+) *ReadyServer {
 	return &ReadyServer{
-		tracker: tunnelstate.NewConnTracker(log),
+		clientID,
+		tracker,
 	}
 }
 
-func (rs *ReadyServer) OnTunnelEvent(c conn.Event) {
-	rs.tracker.OnTunnelEvent(c)
-}
-
 type body struct {
-	Status           int  `json:"status"`
-	ReadyConnections uint `json:"readyConnections"`
+	Status           int       `json:"status"`
+	ReadyConnections uint      `json:"readyConnections"`
+	ConnectorID      uuid.UUID `json:"connectorId"`
 }
 
 // ServeHTTP responds with HTTP 200 if the tunnel is connected to the edge.
@@ -39,6 +40,7 @@ func (rs *ReadyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	body := body{
 		Status:           statusCode,
 		ReadyConnections: readyConnections,
+		ConnectorID:      rs.clientID,
 	}
 	msg, err := json.Marshal(body)
 	if err != nil {

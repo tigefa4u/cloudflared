@@ -1,20 +1,19 @@
 # Requirements
-1. Python 3.7 or later with packages in the given `requirements.txt`
-   - E.g. with conda:
-   - `conda create -n component-tests python=3.7`  
-   - `conda activate component-tests`
-   - `pip3 install -r requirements.txt`
+1. Python 3.10 or later with packages in the given `requirements.txt`
+   - E.g. with venv:
+   - `python3 -m venv ./.venv`  
+   - `source ./.venv/bin/activate`
+   - `python3 -m pip install -r requirements.txt`
 
 2. Create a config yaml file, for example:
 ```
 cloudflared_binary: "cloudflared"
 tunnel: "3d539f97-cd3a-4d8e-c33b-65e9099c7a8d"
 credentials_file: "/Users/tunnel/.cloudflared/3d539f97-cd3a-4d8e-c33b-65e9099c7a8d.json"
-classic_hostname: "classic-tunnel-component-tests.example.com"
 origincert: "/Users/tunnel/.cloudflared/cert.pem"
 ingress:
 - hostname: named-tunnel-component-tests.example.com
-  service: http_status:200
+  service: hello_world
 - service: http_status:404
 ```
 

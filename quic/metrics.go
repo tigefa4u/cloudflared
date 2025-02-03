@@ -1,10 +1,13 @@
 package quic
 
 import (
+	"reflect"
+	"strings"
 	"sync"
 
-	"github.com/lucas-clemente/quic-go/logging"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/quic-go/quic-go/logging"
+	"github.com/rs/zerolog"
 )
 
 const (
@@ -15,57 +18,114 @@ var (
 	clientConnLabels = []string{"conn_index"}
 	clientMetrics    = struct {
 		totalConnections  prometheus.Counter
-		closedConnections *prometheus.CounterVec
-		sentPackets       *prometheus.CounterVec
+		closedConnections prometheus.Counter
+		maxUDPPayloadSize *prometheus.GaugeVec
+		sentFrames        *prometheus.CounterVec
 		sentBytes         *prometheus.CounterVec
-		receivePackets    *prometheus.CounterVec
-		receiveBytes      *prometheus.CounterVec
+		receivedFrames    *prometheus.CounterVec
+		receivedBytes     *prometheus.CounterVec
 		bufferedPackets   *prometheus.CounterVec
 		droppedPackets    *prometheus.CounterVec
 		lostPackets       *prometheus.CounterVec
 		minRTT            *prometheus.GaugeVec
 		latestRTT         *prometheus.GaugeVec
 		smoothedRTT       *prometheus.GaugeVec
+		mtu               *prometheus.GaugeVec
+		congestionWindow  *prometheus.GaugeVec
+		congestionState   *prometheus.GaugeVec
 	}{
 		totalConnections: prometheus.NewCounter(
-			totalConnectionsOpts(logging.PerspectiveClient),
+			prometheus.CounterOpts{
+				Namespace: namespace,
+				Subsystem: "client",
+				Name:      "total_connections",
+				Help:      "Number of connections initiated",
+			},
 		),
-		closedConnections: prometheus.NewCounterVec(
-			closedConnectionsOpts(logging.PerspectiveClient),
-			[]string{"error"},
+		closedConnections: prometheus.NewCounter(
+			prometheus.CounterOpts{
+				Namespace: namespace,
+				Subsystem: "client",
+				Name:      "closed_connections",
+				Help:      "Number of connections that has been closed",
+			},
 		),
-		sentPackets: prometheus.NewCounterVec(
-			sentPacketsOpts(logging.PerspectiveClient),
+		maxUDPPayloadSize: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Namespace: namespace,
+				Subsystem: "client",
+				Name:      "max_udp_payload",
+				Help:      "Maximum UDP payload size in bytes for a QUIC packet",
+			},
 			clientConnLabels,
+		),
+		sentFrames: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Namespace: namespace,
+				Subsystem: "client",
+				Name:      "sent_frames",
+				Help:      "Number of frames that have been sent through a connection",
+			},
+			append(clientConnLabels, "frame_type"),
 		),
 		sentBytes: prometheus.NewCounterVec(
-			sentBytesOpts(logging.PerspectiveClient),
+			prometheus.CounterOpts{
+				Namespace: namespace,
+				Subsystem: "client",
+				Name:      "sent_bytes",
+				Help:      "Number of bytes that have been sent through a connection",
+			},
 			clientConnLabels,
 		),
-		receivePackets: prometheus.NewCounterVec(
-			receivePacketsOpts(logging.PerspectiveClient),
-			clientConnLabels,
+		receivedFrames: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Namespace: namespace,
+				Subsystem: "client",
+				Name:      "received_frames",
+				Help:      "Number of frames that have been received through a connection",
+			},
+			append(clientConnLabels, "frame_type"),
 		),
-		receiveBytes: prometheus.NewCounterVec(
-			receiveBytesOpts(logging.PerspectiveClient),
+		receivedBytes: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Namespace: namespace,
+				Subsystem: "client",
+				Name:      "receive_bytes",
+				Help:      "Number of bytes that have been received through a connection",
+			},
 			clientConnLabels,
 		),
 		bufferedPackets: prometheus.NewCounterVec(
-			bufferedPacketsOpts(logging.PerspectiveClient),
+			prometheus.CounterOpts{
+				Namespace: namespace,
+				Subsystem: "client",
+				Name:      "buffered_packets",
+				Help:      "Number of bytes that have been buffered on a connection",
+			},
 			append(clientConnLabels, "packet_type"),
 		),
 		droppedPackets: prometheus.NewCounterVec(
-			droppedPacketsOpts(logging.PerspectiveClient),
+			prometheus.CounterOpts{
+				Namespace: namespace,
+				Subsystem: "client",
+				Name:      "dropped_packets",
+				Help:      "Number of bytes that have been dropped on a connection",
+			},
 			append(clientConnLabels, "packet_type", "reason"),
 		),
 		lostPackets: prometheus.NewCounterVec(
-			lostPacketsOpts(logging.PerspectiveClient),
+			prometheus.CounterOpts{
+				Namespace: namespace,
+				Subsystem: "client",
+				Name:      "lost_packets",
+				Help:      "Number of packets that have been lost from a connection",
+			},
 			append(clientConnLabels, "reason"),
 		),
 		minRTT: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Namespace: namespace,
-				Subsystem: perspectiveString(logging.PerspectiveClient),
+				Subsystem: "client",
 				Name:      "min_rtt",
 				Help:      "Lowest RTT measured on a connection in millisec",
 			},
@@ -74,7 +134,7 @@ var (
 		latestRTT: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Namespace: namespace,
-				Subsystem: perspectiveString(logging.PerspectiveClient),
+				Subsystem: "client",
 				Name:      "latest_rtt",
 				Help:      "Latest RTT measured on a connection",
 			},
@@ -83,191 +143,82 @@ var (
 		smoothedRTT: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Namespace: namespace,
-				Subsystem: perspectiveString(logging.PerspectiveClient),
+				Subsystem: "client",
 				Name:      "smoothed_rtt",
 				Help:      "Calculated smoothed RTT measured on a connection in millisec",
 			},
 			clientConnLabels,
 		),
-	}
-	// The server has many QUIC connections. Adding per connection label incurs high memory cost
-	serverMetrics = struct {
-		totalConnections  prometheus.Counter
-		closedConnections prometheus.Counter
-		sentPackets       prometheus.Counter
-		sentBytes         prometheus.Counter
-		receivePackets    prometheus.Counter
-		receiveBytes      prometheus.Counter
-		bufferedPackets   *prometheus.CounterVec
-		droppedPackets    *prometheus.CounterVec
-		lostPackets       *prometheus.CounterVec
-		rtt               prometheus.Histogram
-	}{
-		totalConnections: prometheus.NewCounter(
-			totalConnectionsOpts(logging.PerspectiveServer),
-		),
-		closedConnections: prometheus.NewCounter(
-			closedConnectionsOpts(logging.PerspectiveServer),
-		),
-		sentPackets: prometheus.NewCounter(
-			sentPacketsOpts(logging.PerspectiveServer),
-		),
-		sentBytes: prometheus.NewCounter(
-			sentBytesOpts(logging.PerspectiveServer),
-		),
-		receivePackets: prometheus.NewCounter(
-			receivePacketsOpts(logging.PerspectiveServer),
-		),
-		receiveBytes: prometheus.NewCounter(
-			receiveBytesOpts(logging.PerspectiveServer),
-		),
-		bufferedPackets: prometheus.NewCounterVec(
-			bufferedPacketsOpts(logging.PerspectiveServer),
-			[]string{"packet_type"},
-		),
-		droppedPackets: prometheus.NewCounterVec(
-			droppedPacketsOpts(logging.PerspectiveServer),
-			[]string{"packet_type", "reason"},
-		),
-		lostPackets: prometheus.NewCounterVec(
-			lostPacketsOpts(logging.PerspectiveServer),
-			[]string{"reason"},
-		),
-		rtt: prometheus.NewHistogram(
-			prometheus.HistogramOpts{
+		mtu: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
 				Namespace: namespace,
-				Subsystem: perspectiveString(logging.PerspectiveServer),
-				Name:      "rtt",
-				Buckets:   []float64{5, 10, 20, 30, 40, 50, 75, 100},
+				Subsystem: "client",
+				Name:      "mtu",
+				Help:      "Current maximum transmission unit (MTU) of a connection",
 			},
+			clientConnLabels,
+		),
+		congestionWindow: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Namespace: namespace,
+				Subsystem: "client",
+				Name:      "congestion_window",
+				Help:      "Current congestion window size",
+			},
+			clientConnLabels,
+		),
+		congestionState: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Namespace: namespace,
+				Subsystem: "client",
+				Name:      "congestion_state",
+				Help:      "Current congestion control state. See https://pkg.go.dev/github.com/quic-go/quic-go@v0.45.0/logging#CongestionState for what each value maps to",
+			},
+			clientConnLabels,
 		),
 	}
+
 	registerClient = sync.Once{}
-	registerServer = sync.Once{}
+
+	packetTooBigDropped = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "client",
+		Name:      "packet_too_big_dropped",
+		Help:      "Count of packets received from origin that are too big to send to the edge and are dropped as a result",
+	})
 )
 
-// MetricsCollector abstracts the difference between client and server metrics from connTracer
-type MetricsCollector interface {
-	startedConnection()
-	closedConnection(err error)
-	sentPackets(logging.ByteCount)
-	receivedPackets(logging.ByteCount)
-	bufferedPackets(logging.PacketType)
-	droppedPackets(logging.PacketType, logging.ByteCount, logging.PacketDropReason)
-	lostPackets(logging.PacketLossReason)
-	updatedRTT(*logging.RTTStats)
-}
-
-func totalConnectionsOpts(p logging.Perspective) prometheus.CounterOpts {
-	var help string
-	if p == logging.PerspectiveClient {
-		help = "Number of connections initiated. For all quic metrics, client means the side initiating the connection"
-	} else {
-		help = "Number of connections accepted. For all quic metrics, server means the side accepting connections"
-	}
-	return prometheus.CounterOpts{
-		Namespace: namespace,
-		Subsystem: perspectiveString(p),
-		Name:      "total_connections",
-		Help:      help,
-	}
-}
-
-func closedConnectionsOpts(p logging.Perspective) prometheus.CounterOpts {
-	return prometheus.CounterOpts{
-		Namespace: namespace,
-		Subsystem: perspectiveString(p),
-		Name:      "closed_connections",
-		Help:      "Number of connections that has been closed",
-	}
-}
-
-func sentPacketsOpts(p logging.Perspective) prometheus.CounterOpts {
-	return prometheus.CounterOpts{
-		Namespace: namespace,
-		Subsystem: perspectiveString(p),
-		Name:      "sent_packets",
-		Help:      "Number of packets that have been sent through a connection",
-	}
-}
-
-func sentBytesOpts(p logging.Perspective) prometheus.CounterOpts {
-	return prometheus.CounterOpts{
-		Namespace: namespace,
-		Subsystem: perspectiveString(p),
-		Name:      "sent_bytes",
-		Help:      "Number of bytes that have been sent through a connection",
-	}
-}
-
-func receivePacketsOpts(p logging.Perspective) prometheus.CounterOpts {
-	return prometheus.CounterOpts{
-		Namespace: namespace,
-		Subsystem: perspectiveString(p),
-		Name:      "receive_packets",
-		Help:      "Number of packets that have been received through a connection",
-	}
-}
-
-func receiveBytesOpts(p logging.Perspective) prometheus.CounterOpts {
-	return prometheus.CounterOpts{
-		Namespace: namespace,
-		Subsystem: perspectiveString(p),
-		Name:      "receive_bytes",
-		Help:      "Number of bytes that have been received through a connection",
-	}
-}
-
-func bufferedPacketsOpts(p logging.Perspective) prometheus.CounterOpts {
-	return prometheus.CounterOpts{
-		Namespace: namespace,
-		Subsystem: perspectiveString(p),
-		Name:      "buffered_packets",
-		Help:      "Number of bytes that have been buffered on a connection",
-	}
-}
-
-func droppedPacketsOpts(p logging.Perspective) prometheus.CounterOpts {
-	return prometheus.CounterOpts{
-		Namespace: namespace,
-		Subsystem: perspectiveString(p),
-		Name:      "dropped_packets",
-		Help:      "Number of bytes that have been dropped on a connection",
-	}
-}
-
-func lostPacketsOpts(p logging.Perspective) prometheus.CounterOpts {
-	return prometheus.CounterOpts{
-		Namespace: namespace,
-		Subsystem: perspectiveString(p),
-		Name:      "lost_packets",
-		Help:      "Number of packets that have been lost from a connection",
-	}
-}
-
 type clientCollector struct {
-	index string
+	index  string
+	logger *zerolog.Logger
 }
 
-func newClientCollector(index uint8) MetricsCollector {
+func newClientCollector(index string, logger *zerolog.Logger) *clientCollector {
 	registerClient.Do(func() {
 		prometheus.MustRegister(
 			clientMetrics.totalConnections,
 			clientMetrics.closedConnections,
-			clientMetrics.sentPackets,
+			clientMetrics.maxUDPPayloadSize,
+			clientMetrics.sentFrames,
 			clientMetrics.sentBytes,
-			clientMetrics.receivePackets,
-			clientMetrics.receiveBytes,
+			clientMetrics.receivedFrames,
+			clientMetrics.receivedBytes,
 			clientMetrics.bufferedPackets,
 			clientMetrics.droppedPackets,
 			clientMetrics.lostPackets,
 			clientMetrics.minRTT,
 			clientMetrics.latestRTT,
 			clientMetrics.smoothedRTT,
+			clientMetrics.mtu,
+			clientMetrics.congestionWindow,
+			clientMetrics.congestionState,
+			packetTooBigDropped,
 		)
 	})
+
 	return &clientCollector{
-		index: uint8ToString(index),
+		index:  index,
+		logger: logger,
 	}
 }
 
@@ -275,18 +226,21 @@ func (cc *clientCollector) startedConnection() {
 	clientMetrics.totalConnections.Inc()
 }
 
-func (cc *clientCollector) closedConnection(err error) {
-	clientMetrics.closedConnections.WithLabelValues(err.Error()).Inc()
+func (cc *clientCollector) closedConnection(error) {
+	clientMetrics.closedConnections.Inc()
 }
 
-func (cc *clientCollector) sentPackets(size logging.ByteCount) {
-	clientMetrics.sentPackets.WithLabelValues(cc.index).Inc()
-	clientMetrics.sentBytes.WithLabelValues(cc.index).Add(byteCountToPromCount(size))
+func (cc *clientCollector) receivedTransportParameters(params *logging.TransportParameters) {
+	clientMetrics.maxUDPPayloadSize.WithLabelValues(cc.index).Set(float64(params.MaxUDPPayloadSize))
+	cc.logger.Debug().Msgf("Received transport parameters: MaxUDPPayloadSize=%d, MaxIdleTimeout=%v, MaxDatagramFrameSize=%d", params.MaxUDPPayloadSize, params.MaxIdleTimeout, params.MaxDatagramFrameSize)
 }
 
-func (cc *clientCollector) receivedPackets(size logging.ByteCount) {
-	clientMetrics.receivePackets.WithLabelValues(cc.index).Inc()
-	clientMetrics.receiveBytes.WithLabelValues(cc.index).Add(byteCountToPromCount(size))
+func (cc *clientCollector) sentPackets(size logging.ByteCount, frames []logging.Frame) {
+	cc.collectPackets(size, frames, clientMetrics.sentFrames, clientMetrics.sentBytes, sent)
+}
+
+func (cc *clientCollector) receivedPackets(size logging.ByteCount, frames []logging.Frame) {
+	cc.collectPackets(size, frames, clientMetrics.receivedFrames, clientMetrics.receivedBytes, received)
 }
 
 func (cc *clientCollector) bufferedPackets(packetType logging.PacketType) {
@@ -311,63 +265,51 @@ func (cc *clientCollector) updatedRTT(rtt *logging.RTTStats) {
 	clientMetrics.smoothedRTT.WithLabelValues(cc.index).Set(durationToPromGauge(rtt.SmoothedRTT()))
 }
 
-type serverCollector struct{}
-
-func newServiceCollector() MetricsCollector {
-	registerServer.Do(func() {
-		prometheus.MustRegister(
-			serverMetrics.totalConnections,
-			serverMetrics.closedConnections,
-			serverMetrics.sentPackets,
-			serverMetrics.sentBytes,
-			serverMetrics.receivePackets,
-			serverMetrics.receiveBytes,
-			serverMetrics.bufferedPackets,
-			serverMetrics.droppedPackets,
-			serverMetrics.lostPackets,
-			serverMetrics.rtt,
-		)
-	})
-	return &serverCollector{}
+func (cc *clientCollector) updateCongestionWindow(size logging.ByteCount) {
+	clientMetrics.congestionWindow.WithLabelValues(cc.index).Set(float64(size))
 }
 
-func (sc *serverCollector) startedConnection() {
-	serverMetrics.totalConnections.Inc()
+func (cc *clientCollector) updatedCongestionState(state logging.CongestionState) {
+	clientMetrics.congestionState.WithLabelValues(cc.index).Set(float64(state))
 }
 
-func (sc *serverCollector) closedConnection(err error) {
-	serverMetrics.closedConnections.Inc()
+func (cc *clientCollector) updateMTU(mtu logging.ByteCount) {
+	clientMetrics.mtu.WithLabelValues(cc.index).Set(float64(mtu))
+	cc.logger.Debug().Msgf("QUIC MTU updated to %d", mtu)
 }
 
-func (sc *serverCollector) sentPackets(size logging.ByteCount) {
-	serverMetrics.sentPackets.Inc()
-	serverMetrics.sentBytes.Add(byteCountToPromCount(size))
-}
-
-func (sc *serverCollector) receivedPackets(size logging.ByteCount) {
-	serverMetrics.receivePackets.Inc()
-	serverMetrics.receiveBytes.Add(byteCountToPromCount(size))
-}
-
-func (sc *serverCollector) bufferedPackets(packetType logging.PacketType) {
-	serverMetrics.bufferedPackets.WithLabelValues(packetTypeString(packetType)).Inc()
-}
-
-func (sc *serverCollector) droppedPackets(packetType logging.PacketType, size logging.ByteCount, reason logging.PacketDropReason) {
-	serverMetrics.droppedPackets.WithLabelValues(
-		packetTypeString(packetType),
-		packetDropReasonString(reason),
-	).Add(byteCountToPromCount(size))
-}
-
-func (sc *serverCollector) lostPackets(reason logging.PacketLossReason) {
-	serverMetrics.lostPackets.WithLabelValues(packetLossReasonString(reason)).Inc()
-}
-
-func (sc *serverCollector) updatedRTT(rtt *logging.RTTStats) {
-	latestRTT := rtt.LatestRTT()
-	// May return 0 if no valid updates have occurred
-	if latestRTT > 0 {
-		serverMetrics.rtt.Observe(durationToPromGauge(latestRTT))
+func (cc *clientCollector) collectPackets(size logging.ByteCount, frames []logging.Frame, counter, bandwidth *prometheus.CounterVec, direction direction) {
+	for _, frame := range frames {
+		switch f := frame.(type) {
+		case logging.DataBlockedFrame:
+			cc.logger.Debug().Msgf("%s data_blocked frame", direction)
+		case logging.StreamDataBlockedFrame:
+			cc.logger.Debug().Int64("streamID", int64(f.StreamID)).Msgf("%s stream_data_blocked frame", direction)
+		}
+		counter.WithLabelValues(cc.index, frameName(frame)).Inc()
 	}
+	bandwidth.WithLabelValues(cc.index).Add(byteCountToPromCount(size))
+}
+
+func frameName(frame logging.Frame) string {
+	if frame == nil {
+		return "nil"
+	} else {
+		name := reflect.TypeOf(frame).Elem().Name()
+		return strings.TrimSuffix(name, "Frame")
+	}
+}
+
+type direction uint8
+
+const (
+	sent direction = iota
+	received
+)
+
+func (d direction) String() string {
+	if d == sent {
+		return "sent"
+	}
+	return "received"
 }

@@ -1,6 +1,7 @@
 package tunnelstate
 
 import (
+	"net"
 	"sync"
 
 	"github.com/rs/zerolog"
@@ -9,47 +10,94 @@ import (
 )
 
 type ConnTracker struct {
-	sync.RWMutex
-	isConnected map[int]bool
-	log         *zerolog.Logger
+	mutex sync.RWMutex
+	// int is the connection Index
+	connectionInfo map[uint8]ConnectionInfo
+	log            *zerolog.Logger
 }
 
-func NewConnTracker(log *zerolog.Logger) *ConnTracker {
-	return &ConnTracker{
-		isConnected: make(map[int]bool, 0),
-		log:         log,
-	}
+type ConnectionInfo struct {
+	IsConnected bool                `json:"isConnected,omitempty"`
+	Protocol    connection.Protocol `json:"protocol,omitempty"`
+	EdgeAddress net.IP              `json:"edgeAddress,omitempty"`
 }
 
-func MockedConnTracker(mocked map[int]bool) *ConnTracker {
+// Convinience struct to extend the connection with its index.
+type IndexedConnectionInfo struct {
+	ConnectionInfo
+	Index uint8 `json:"index,omitempty"`
+}
+
+func NewConnTracker(
+	log *zerolog.Logger,
+) *ConnTracker {
 	return &ConnTracker{
-		isConnected: mocked,
+		connectionInfo: make(map[uint8]ConnectionInfo, 0),
+		log:            log,
 	}
 }
 
 func (ct *ConnTracker) OnTunnelEvent(c connection.Event) {
 	switch c.EventType {
 	case connection.Connected:
-		ct.Lock()
-		ct.isConnected[int(c.Index)] = true
-		ct.Unlock()
+		ct.mutex.Lock()
+		ci := ConnectionInfo{
+			IsConnected: true,
+			Protocol:    c.Protocol,
+			EdgeAddress: c.EdgeAddress,
+		}
+		ct.connectionInfo[c.Index] = ci
+		ct.mutex.Unlock()
 	case connection.Disconnected, connection.Reconnecting, connection.RegisteringTunnel, connection.Unregistering:
-		ct.Lock()
-		ct.isConnected[int(c.Index)] = false
-		ct.Unlock()
+		ct.mutex.Lock()
+		ci := ct.connectionInfo[c.Index]
+		ci.IsConnected = false
+		ct.connectionInfo[c.Index] = ci
+		ct.mutex.Unlock()
 	default:
 		ct.log.Error().Msgf("Unknown connection event case %v", c)
 	}
 }
 
 func (ct *ConnTracker) CountActiveConns() uint {
-	ct.RLock()
-	defer ct.RUnlock()
+	ct.mutex.RLock()
+	defer ct.mutex.RUnlock()
 	active := uint(0)
-	for _, connected := range ct.isConnected {
-		if connected {
+	for _, ci := range ct.connectionInfo {
+		if ci.IsConnected {
 			active++
 		}
 	}
 	return active
+}
+
+// HasConnectedWith checks if we've ever had a successful connection to the edge
+// with said protocol.
+func (ct *ConnTracker) HasConnectedWith(protocol connection.Protocol) bool {
+	ct.mutex.RLock()
+	defer ct.mutex.RUnlock()
+	for _, ci := range ct.connectionInfo {
+		if ci.Protocol == protocol {
+			return true
+		}
+	}
+	return false
+}
+
+// Returns the connection information iff it is connected this
+// also leverages the [IndexedConnectionInfo] to also provide the connection index
+func (ct *ConnTracker) GetActiveConnections() []IndexedConnectionInfo {
+	ct.mutex.RLock()
+	defer ct.mutex.RUnlock()
+
+	connections := make([]IndexedConnectionInfo, 0)
+
+	for key, value := range ct.connectionInfo {
+		if value.IsConnected {
+			info := IndexedConnectionInfo{value, key}
+			connections = append(connections, info)
+		}
+	}
+
+	return connections
 }

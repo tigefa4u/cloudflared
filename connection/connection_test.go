@@ -2,37 +2,38 @@ package connection
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
-	"net/url"
-	"testing"
 	"time"
 
-	"github.com/gobwas/ws/wsutil"
+	pkgerrors "github.com/pkg/errors"
 	"github.com/rs/zerolog"
-	"github.com/stretchr/testify/assert"
 
-	"github.com/cloudflare/cloudflared/ingress"
+	cfdflow "github.com/cloudflare/cloudflared/flow"
+
+	"github.com/cloudflare/cloudflared/stream"
+	"github.com/cloudflare/cloudflared/tracing"
+	tunnelpogs "github.com/cloudflare/cloudflared/tunnelrpc/pogs"
+	"github.com/cloudflare/cloudflared/websocket"
 )
 
 const (
-	largeFileSize = 2 * 1024 * 1024
+	largeFileSize   = 2 * 1024 * 1024
+	testGracePeriod = time.Millisecond * 100
 )
 
 var (
-	unusedWarpRoutingService = (*ingress.WarpRoutingService)(nil)
-	testConfig               = &Config{
-		OriginProxy: &mockOriginProxy{},
-		GracePeriod: time.Millisecond * 100,
+	testOrchestrator = &mockOrchestrator{
+		originProxy: &mockOriginProxy{},
 	}
 	log           = zerolog.Nop()
-	testOriginURL = &url.URL{
-		Scheme: "https",
-		Host:   "connectiontest.argotunnel.com",
-	}
 	testLargeResp = make([]byte, largeFileSize)
 )
+
+var _ ReadWriteAcker = (*HTTPResponseReadWriteAcker)(nil)
 
 type testRequest struct {
 	name           string
@@ -42,15 +43,46 @@ type testRequest struct {
 	isProxyError   bool
 }
 
+type mockOrchestrator struct {
+	originProxy OriginProxy
+}
+
+func (mcr *mockOrchestrator) GetConfigJSON() ([]byte, error) {
+	return nil, fmt.Errorf("not implemented")
+}
+
+func (*mockOrchestrator) UpdateConfig(version int32, config []byte) *tunnelpogs.UpdateConfigurationResponse {
+	return &tunnelpogs.UpdateConfigurationResponse{
+		LastAppliedVersion: version,
+	}
+}
+
+func (mcr *mockOrchestrator) GetOriginProxy() (OriginProxy, error) {
+	return mcr.originProxy, nil
+}
+
+func (mcr *mockOrchestrator) WarpRoutingEnabled() (enabled bool) {
+	return true
+}
+
 type mockOriginProxy struct{}
 
 func (moc *mockOriginProxy) ProxyHTTP(
 	w ResponseWriter,
-	req *http.Request,
+	tr *tracing.TracedHTTPRequest,
 	isWebsocket bool,
 ) error {
+	req := tr.Request
 	if isWebsocket {
-		return wsEndpoint(w, req)
+		switch req.URL.Path {
+		case "/ws/echo":
+			return wsEchoEndpoint(w, req)
+		case "/ws/flaky":
+			return wsFlakyEndpoint(w, req)
+		default:
+			originRespEndpoint(w, http.StatusNotFound, []byte("ws endpoint not found"))
+			return fmt.Errorf("unknown websocket endpoint %s", req.URL.Path)
+		}
 	}
 	switch req.URL.Path {
 	case "/ok":
@@ -67,7 +99,6 @@ func (moc *mockOriginProxy) ProxyHTTP(
 		originRespEndpoint(w, http.StatusNotFound, []byte("page not found"))
 	}
 	return nil
-
 }
 
 func (moc *mockOriginProxy) ProxyTCP(
@@ -75,35 +106,91 @@ func (moc *mockOriginProxy) ProxyTCP(
 	rwa ReadWriteAcker,
 	r *TCPRequest,
 ) error {
+	if r.CfTraceID == "flow-rate-limited" {
+		return pkgerrors.Wrap(cfdflow.ErrTooManyActiveFlows, "tcp flow rate limited")
+	}
+
 	return nil
 }
 
-type nowriter struct {
-	io.Reader
+type echoPipe struct {
+	reader *io.PipeReader
+	writer *io.PipeWriter
 }
 
-func (nowriter) Write(p []byte) (int, error) {
-	return 0, fmt.Errorf("Writer not implemented")
+func (ep *echoPipe) Read(p []byte) (int, error) {
+	return ep.reader.Read(p)
 }
 
-func wsEndpoint(w ResponseWriter, r *http.Request) error {
+func (ep *echoPipe) Write(p []byte) (int, error) {
+	return ep.writer.Write(p)
+}
+
+// A mock origin that echos data by streaming like a tcpOverWSConnection
+// https://github.com/cloudflare/cloudflared/blob/master/ingress/origin_connection.go
+func wsEchoEndpoint(w ResponseWriter, r *http.Request) error {
 	resp := &http.Response{
 		StatusCode: http.StatusSwitchingProtocols,
 	}
-	_ = w.WriteRespHeaders(resp.StatusCode, resp.Header)
-	clientReader := nowriter{r.Body}
+	if err := w.WriteRespHeaders(resp.StatusCode, resp.Header); err != nil {
+		return err
+	}
+	wsCtx, cancel := context.WithCancel(r.Context())
+	readPipe, writePipe := io.Pipe()
+
+	wsConn := websocket.NewConn(wsCtx, NewHTTPResponseReadWriterAcker(w, w.(http.Flusher), r), &log)
 	go func() {
-		for {
-			data, err := wsutil.ReadClientText(clientReader)
-			if err != nil {
-				return
-			}
-			if err := wsutil.WriteServerText(w, data); err != nil {
-				return
-			}
+		select {
+		case <-wsCtx.Done():
+		case <-r.Context().Done():
 		}
+		readPipe.Close()
+		writePipe.Close()
 	}()
-	<-r.Context().Done()
+
+	originConn := &echoPipe{reader: readPipe, writer: writePipe}
+	stream.Pipe(wsConn, originConn, &log)
+	cancel()
+	wsConn.Close()
+	return nil
+}
+
+type flakyConn struct {
+	closeAt time.Time
+}
+
+func (fc *flakyConn) Read(p []byte) (int, error) {
+	if time.Now().After(fc.closeAt) {
+		return 0, io.EOF
+	}
+	n := copy(p, "Read from flaky connection")
+	return n, nil
+}
+
+func (fc *flakyConn) Write(p []byte) (int, error) {
+	if time.Now().After(fc.closeAt) {
+		return 0, fmt.Errorf("flaky connection closed")
+	}
+	return len(p), nil
+}
+
+func wsFlakyEndpoint(w ResponseWriter, r *http.Request) error {
+	resp := &http.Response{
+		StatusCode: http.StatusSwitchingProtocols,
+	}
+	if err := w.WriteRespHeaders(resp.StatusCode, resp.Header); err != nil {
+		return err
+	}
+	wsCtx, cancel := context.WithCancel(r.Context())
+
+	wsConn := websocket.NewConn(wsCtx, NewHTTPResponseReadWriterAcker(w, w.(http.Flusher), r), &log)
+
+	rInt, _ := rand.Int(rand.Reader, big.NewInt(50))
+	closedAfter := time.Millisecond * time.Duration(rInt.Int64())
+	originConn := &flakyConn{closeAt: time.Now().Add(closedAfter)}
+	stream.Pipe(wsConn, originConn, &log)
+	cancel()
+	wsConn.Close()
 	return nil
 }
 
@@ -121,41 +208,4 @@ func (mcf mockConnectedFuse) Connected() {}
 
 func (mcf mockConnectedFuse) IsConnected() bool {
 	return true
-}
-
-func TestIsEventStream(t *testing.T) {
-	tests := []struct {
-		headers       http.Header
-		isEventStream bool
-	}{
-		{
-			headers:       newHeader("Content-Type", "text/event-stream"),
-			isEventStream: true,
-		},
-		{
-			headers:       newHeader("content-type", "text/event-stream"),
-			isEventStream: true,
-		},
-		{
-			headers:       newHeader("Content-Type", "text/event-stream; charset=utf-8"),
-			isEventStream: true,
-		},
-		{
-			headers:       newHeader("Content-Type", "application/json"),
-			isEventStream: false,
-		},
-		{
-			headers:       http.Header{},
-			isEventStream: false,
-		},
-	}
-	for _, test := range tests {
-		assert.Equal(t, test.isEventStream, IsServerSentEvent(test.headers))
-	}
-}
-
-func newHeader(key, value string) http.Header {
-	header := http.Header{}
-	header.Add(key, value)
-	return header
 }

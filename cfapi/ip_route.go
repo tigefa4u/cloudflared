@@ -75,10 +75,12 @@ type NewRoute struct {
 // MarshalJSON handles fields with non-JSON types (e.g. net.IPNet).
 func (r NewRoute) MarshalJSON() ([]byte, error) {
 	return json.Marshal(&struct {
+		Network  string     `json:"network"`
 		TunnelID uuid.UUID  `json:"tunnel_id"`
 		Comment  string     `json:"comment"`
 		VNetID   *uuid.UUID `json:"virtual_network_id,omitempty"`
 	}{
+		Network:  r.Network.String(),
 		TunnelID: r.TunnelID,
 		Comment:  r.Comment,
 		VNetID:   r.VNetID,
@@ -87,6 +89,7 @@ func (r NewRoute) MarshalJSON() ([]byte, error) {
 
 // DetailedRoute is just a Route with some extra fields, e.g. TunnelName.
 type DetailedRoute struct {
+	ID       uuid.UUID `json:"id"`
 	Network  CIDR      `json:"network"`
 	TunnelID uuid.UUID `json:"tunnel_id"`
 	// Optional field. When unset, it means the DetailedRoute belongs to the default virtual network.
@@ -115,7 +118,8 @@ func (r DetailedRoute) TableString() string {
 	}
 
 	return fmt.Sprintf(
-		"%s\t%s\t%s\t%s\t%s\t%s\t%s\t",
+		"%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t",
+		r.ID,
 		r.Network.String(),
 		vnetColumn,
 		r.Comment,
@@ -126,12 +130,6 @@ func (r DetailedRoute) TableString() string {
 	)
 }
 
-type DeleteRouteParams struct {
-	Network net.IPNet
-	// Optional field. If unset, backend will assume the default vnet for the account.
-	VNetID *uuid.UUID
-}
-
 type GetRouteByIpParams struct {
 	Ip net.IP
 	// Optional field. If unset, backend will assume the default vnet for the account.
@@ -139,26 +137,30 @@ type GetRouteByIpParams struct {
 }
 
 // ListRoutes calls the Tunnelstore GET endpoint for all routes under an account.
+// Due to pagination on the server side it will call the endpoint multiple times if needed.
 func (r *RESTClient) ListRoutes(filter *IpRouteFilter) ([]*DetailedRoute, error) {
-	endpoint := r.baseEndpoints.accountRoutes
-	endpoint.RawQuery = filter.Encode()
-	resp, err := r.sendRequest("GET", endpoint, nil)
-	if err != nil {
-		return nil, errors.Wrap(err, "REST request failed")
-	}
-	defer resp.Body.Close()
+	fetchFn := func(page int) (*http.Response, error) {
+		endpoint := r.baseEndpoints.accountRoutes
+		filter.Page(page)
+		endpoint.RawQuery = filter.Encode()
+		rsp, err := r.sendRequest("GET", endpoint, nil)
 
-	if resp.StatusCode == http.StatusOK {
-		return parseListDetailedRoutes(resp.Body)
+		if err != nil {
+			return nil, errors.Wrap(err, "REST request failed")
+		}
+		if rsp.StatusCode != http.StatusOK {
+			rsp.Body.Close()
+			return nil, r.statusCodeToError("list routes", rsp)
+		}
+		return rsp, nil
 	}
-
-	return nil, r.statusCodeToError("list routes", resp)
+	return fetchExhaustively[DetailedRoute](fetchFn)
 }
 
 // AddRoute calls the Tunnelstore POST endpoint for a given route.
 func (r *RESTClient) AddRoute(newRoute NewRoute) (Route, error) {
 	endpoint := r.baseEndpoints.accountRoutes
-	endpoint.Path = path.Join(endpoint.Path, "network", url.PathEscape(newRoute.Network.String()))
+	endpoint.Path = path.Join(endpoint.Path)
 	resp, err := r.sendRequest("POST", endpoint, newRoute)
 	if err != nil {
 		return Route{}, errors.Wrap(err, "REST request failed")
@@ -173,10 +175,9 @@ func (r *RESTClient) AddRoute(newRoute NewRoute) (Route, error) {
 }
 
 // DeleteRoute calls the Tunnelstore DELETE endpoint for a given route.
-func (r *RESTClient) DeleteRoute(params DeleteRouteParams) error {
+func (r *RESTClient) DeleteRoute(id uuid.UUID) error {
 	endpoint := r.baseEndpoints.accountRoutes
-	endpoint.Path = path.Join(endpoint.Path, "network", url.PathEscape(params.Network.String()))
-	setVnetParam(&endpoint, params.VNetID)
+	endpoint.Path = path.Join(endpoint.Path, url.PathEscape(id.String()))
 
 	resp, err := r.sendRequest("DELETE", endpoint, nil)
 	if err != nil {
@@ -209,12 +210,6 @@ func (r *RESTClient) GetByIP(params GetRouteByIpParams) (DetailedRoute, error) {
 	}
 
 	return DetailedRoute{}, r.statusCodeToError("get route by IP", resp)
-}
-
-func parseListDetailedRoutes(body io.ReadCloser) ([]*DetailedRoute, error) {
-	var routes []*DetailedRoute
-	err := parseResponse(body, &routes)
-	return routes, err
 }
 
 func parseRoute(body io.ReadCloser) (Route, error) {

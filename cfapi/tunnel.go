@@ -23,6 +23,11 @@ type Tunnel struct {
 	Connections []Connection `json:"connections"`
 }
 
+type TunnelWithToken struct {
+	Tunnel
+	Token string `json:"token"`
+}
+
 type Connection struct {
 	ColoName           string    `json:"colo_name"`
 	ID                 uuid.UUID `json:"id"`
@@ -45,6 +50,10 @@ type newTunnel struct {
 	TunnelSecret []byte `json:"tunnel_secret"`
 }
 
+type managementRequest struct {
+	Resources []string `json:"resources"`
+}
+
 type CleanupParams struct {
 	queryParams url.Values
 }
@@ -63,7 +72,7 @@ func (cp CleanupParams) encode() string {
 	return cp.queryParams.Encode()
 }
 
-func (r *RESTClient) CreateTunnel(name string, tunnelSecret []byte) (*Tunnel, error) {
+func (r *RESTClient) CreateTunnel(name string, tunnelSecret []byte) (*TunnelWithToken, error) {
 	if name == "" {
 		return nil, errors.New("tunnel name required")
 	}
@@ -83,7 +92,11 @@ func (r *RESTClient) CreateTunnel(name string, tunnelSecret []byte) (*Tunnel, er
 
 	switch resp.StatusCode {
 	case http.StatusOK:
-		return unmarshalTunnel(resp.Body)
+		var tunnel TunnelWithToken
+		if serdeErr := parseResponse(resp.Body, &tunnel); serdeErr != nil {
+			return nil, serdeErr
+		}
+		return &tunnel, nil
 	case http.StatusConflict:
 		return nil, ErrTunnelNameConflict
 	}
@@ -107,9 +120,53 @@ func (r *RESTClient) GetTunnel(tunnelID uuid.UUID) (*Tunnel, error) {
 	return nil, r.statusCodeToError("get tunnel", resp)
 }
 
-func (r *RESTClient) DeleteTunnel(tunnelID uuid.UUID) error {
+func (r *RESTClient) GetTunnelToken(tunnelID uuid.UUID) (token string, err error) {
+	endpoint := r.baseEndpoints.accountLevel
+	endpoint.Path = path.Join(endpoint.Path, fmt.Sprintf("%v/token", tunnelID))
+	resp, err := r.sendRequest("GET", endpoint, nil)
+	if err != nil {
+		return "", errors.Wrap(err, "REST request failed")
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		err = parseResponse(resp.Body, &token)
+		return token, err
+	}
+
+	return "", r.statusCodeToError("get tunnel token", resp)
+}
+
+func (r *RESTClient) GetManagementToken(tunnelID uuid.UUID) (token string, err error) {
+	endpoint := r.baseEndpoints.accountLevel
+	endpoint.Path = path.Join(endpoint.Path, fmt.Sprintf("%v/management", tunnelID))
+
+	body := &managementRequest{
+		Resources: []string{"logs"},
+	}
+
+	resp, err := r.sendRequest("POST", endpoint, body)
+	if err != nil {
+		return "", errors.Wrap(err, "REST request failed")
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		err = parseResponse(resp.Body, &token)
+		return token, err
+	}
+
+	return "", r.statusCodeToError("get tunnel token", resp)
+}
+
+func (r *RESTClient) DeleteTunnel(tunnelID uuid.UUID, cascade bool) error {
 	endpoint := r.baseEndpoints.accountLevel
 	endpoint.Path = path.Join(endpoint.Path, fmt.Sprintf("%v", tunnelID))
+	// Cascade will delete all tunnel dependencies (connections, routes, etc.) that
+	// are linked to the deleted tunnel.
+	if cascade {
+		endpoint.RawQuery = "cascade=true"
+	}
 	resp, err := r.sendRequest("DELETE", endpoint, nil)
 	if err != nil {
 		return errors.Wrap(err, "REST request failed")
@@ -120,25 +177,22 @@ func (r *RESTClient) DeleteTunnel(tunnelID uuid.UUID) error {
 }
 
 func (r *RESTClient) ListTunnels(filter *TunnelFilter) ([]*Tunnel, error) {
-	endpoint := r.baseEndpoints.accountLevel
-	endpoint.RawQuery = filter.encode()
-	resp, err := r.sendRequest("GET", endpoint, nil)
-	if err != nil {
-		return nil, errors.Wrap(err, "REST request failed")
+	fetchFn := func(page int) (*http.Response, error) {
+		endpoint := r.baseEndpoints.accountLevel
+		filter.Page(page)
+		endpoint.RawQuery = filter.encode()
+		rsp, err := r.sendRequest("GET", endpoint, nil)
+		if err != nil {
+			return nil, errors.Wrap(err, "REST request failed")
+		}
+		if rsp.StatusCode != http.StatusOK {
+			rsp.Body.Close()
+			return nil, r.statusCodeToError("list tunnels", rsp)
+		}
+		return rsp, nil
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusOK {
-		return parseListTunnels(resp.Body)
-	}
-
-	return nil, r.statusCodeToError("list tunnels", resp)
-}
-
-func parseListTunnels(body io.ReadCloser) ([]*Tunnel, error) {
-	var tunnels []*Tunnel
-	err := parseResponse(body, &tunnels)
-	return tunnels, err
+	return fetchExhaustively[Tunnel](fetchFn)
 }
 
 func (r *RESTClient) ListActiveClients(tunnelID uuid.UUID) ([]*ActiveClient, error) {

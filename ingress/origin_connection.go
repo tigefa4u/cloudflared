@@ -4,11 +4,13 @@ import (
 	"context"
 	"io"
 	"net"
+	"time"
 
 	"github.com/rs/zerolog"
 
 	"github.com/cloudflare/cloudflared/ipaccess"
 	"github.com/cloudflare/cloudflared/socks"
+	"github.com/cloudflare/cloudflared/stream"
 	"github.com/cloudflare/cloudflared/websocket"
 )
 
@@ -25,20 +27,37 @@ type streamHandlerFunc func(originConn io.ReadWriter, remoteConn net.Conn, log *
 // DefaultStreamHandler is an implementation of streamHandlerFunc that
 // performs a two way io.Copy between originConn and remoteConn.
 func DefaultStreamHandler(originConn io.ReadWriter, remoteConn net.Conn, log *zerolog.Logger) {
-	websocket.Stream(originConn, remoteConn, log)
+	stream.Pipe(originConn, remoteConn, log)
 }
 
 // tcpConnection is an OriginConnection that directly streams to raw TCP.
 type tcpConnection struct {
-	conn net.Conn
+	net.Conn
+	writeTimeout time.Duration
+	logger       *zerolog.Logger
 }
 
-func (tc *tcpConnection) Stream(ctx context.Context, tunnelConn io.ReadWriter, log *zerolog.Logger) {
-	websocket.Stream(tunnelConn, tc.conn, log)
+func (tc *tcpConnection) Stream(_ context.Context, tunnelConn io.ReadWriter, _ *zerolog.Logger) {
+	stream.Pipe(tunnelConn, tc, tc.logger)
+}
+
+func (tc *tcpConnection) Write(b []byte) (int, error) {
+	if tc.writeTimeout > 0 {
+		if err := tc.Conn.SetWriteDeadline(time.Now().Add(tc.writeTimeout)); err != nil {
+			tc.logger.Err(err).Msg("Error setting write deadline for TCP connection")
+		}
+	}
+
+	nBytes, err := tc.Conn.Write(b)
+	if err != nil {
+		tc.logger.Err(err).Msg("Error writing to the TCP connection")
+	}
+
+	return nBytes, err
 }
 
 func (tc *tcpConnection) Close() {
-	tc.conn.Close()
+	tc.Conn.Close()
 }
 
 // tcpOverWSConnection is an OriginConnection that streams to TCP over WS.
@@ -53,7 +72,7 @@ func (wc *tcpOverWSConnection) Stream(ctx context.Context, tunnelConn io.ReadWri
 	wc.streamHandler(wsConn, wc.conn, log)
 	cancel()
 	// Makes sure wsConn stops sending ping before terminating the stream
-	wsConn.WaitForShutdown()
+	wsConn.Close()
 }
 
 func (wc *tcpOverWSConnection) Close() {
@@ -73,21 +92,8 @@ func (sp *socksProxyOverWSConnection) Stream(ctx context.Context, tunnelConn io.
 	socks.StreamNetHandler(wsConn, sp.accessPolicy, log)
 	cancel()
 	// Makes sure wsConn stops sending ping before terminating the stream
-	wsConn.WaitForShutdown()
+	wsConn.Close()
 }
 
 func (sp *socksProxyOverWSConnection) Close() {
-}
-
-// wsProxyConnection represents a bidirectional stream for a websocket connection to the origin
-type wsProxyConnection struct {
-	rwc io.ReadWriteCloser
-}
-
-func (conn *wsProxyConnection) Stream(ctx context.Context, tunnelConn io.ReadWriter, log *zerolog.Logger) {
-	websocket.Stream(tunnelConn, conn.rwc, log)
-}
-
-func (conn *wsProxyConnection) Close() {
-	conn.rwc.Close()
 }

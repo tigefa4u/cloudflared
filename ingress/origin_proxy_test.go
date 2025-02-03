@@ -3,12 +3,11 @@ package ingress
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -37,7 +36,7 @@ func TestRawTCPServiceEstablishConnection(t *testing.T) {
 	require.NoError(t, err)
 
 	// Origin not listening for new connection, should return an error
-	_, err = rawTCPService.EstablishConnection(req.URL.String())
+	_, err = rawTCPService.EstablishConnection(context.Background(), req.URL.String(), TestLogger)
 	require.Error(t, err)
 }
 
@@ -88,7 +87,7 @@ func TestTCPOverWSServiceEstablishConnection(t *testing.T) {
 		t.Run(test.testCase, func(t *testing.T) {
 			if test.expectErr {
 				bastionHost, _ := carrier.ResolveBastionDest(test.req)
-				_, err := test.service.EstablishConnection(bastionHost)
+				_, err := test.service.EstablishConnection(context.Background(), bastionHost, TestLogger)
 				assert.Error(t, err)
 			}
 		})
@@ -100,7 +99,7 @@ func TestTCPOverWSServiceEstablishConnection(t *testing.T) {
 	for _, service := range []*tcpOverWSService{newTCPOverWSService(originURL), newBastionService()} {
 		// Origin not listening for new connection, should return an error
 		bastionHost, _ := carrier.ResolveBastionDest(bastionReq)
-		_, err := service.EstablishConnection(bastionHost)
+		_, err := service.EstablishConnection(context.Background(), bastionHost, TestLogger)
 		assert.Error(t, err)
 	}
 }
@@ -132,10 +131,8 @@ func TestHTTPServiceHostHeaderOverride(t *testing.T) {
 	httpService := &httpService{
 		url: originURL,
 	}
-	var wg sync.WaitGroup
 	shutdownC := make(chan struct{})
-	errC := make(chan error)
-	require.NoError(t, httpService.start(&wg, testLogger, shutdownC, errC, cfg))
+	require.NoError(t, httpService.start(TestLogger, shutdownC, cfg))
 
 	req, err := http.NewRequest(http.MethodGet, originURL.String(), nil)
 	require.NoError(t, err)
@@ -144,10 +141,49 @@ func TestHTTPServiceHostHeaderOverride(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
-	respBody, err := ioutil.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	require.Equal(t, respBody, []byte(originURL.Host))
+}
 
+// TestHTTPServiceUsesIngressRuleScheme makes sure httpService uses scheme defined in ingress rule and not by eyeball request
+func TestHTTPServiceUsesIngressRuleScheme(t *testing.T) {
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		require.NotNil(t, r.TLS)
+		// Echo the X-Forwarded-Proto header for assertions
+		w.Write([]byte(r.Header.Get("X-Forwarded-Proto")))
+	}
+	origin := httptest.NewTLSServer(http.HandlerFunc(handler))
+	defer origin.Close()
+
+	originURL, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+	require.Equal(t, "https", originURL.Scheme)
+
+	cfg := OriginRequestConfig{
+		NoTLSVerify: true,
+	}
+	httpService := &httpService{
+		url: originURL,
+	}
+	shutdownC := make(chan struct{})
+	require.NoError(t, httpService.start(TestLogger, shutdownC, cfg))
+
+	// Tunnel uses scheme defined in the service field of the ingress rule, independent of the X-Forwarded-Proto header
+	protos := []string{"https", "http", "dne"}
+	for _, p := range protos {
+		req, err := http.NewRequest(http.MethodGet, originURL.String(), nil)
+		require.NoError(t, err)
+		req.Header.Add("X-Forwarded-Proto", p)
+
+		resp, err := httpService.RoundTrip(req)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		respBody, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		require.Equal(t, respBody, []byte(p))
+	}
 }
 
 func tcpListenRoutine(listener net.Listener, closeChan chan struct{}) {

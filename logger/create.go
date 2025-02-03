@@ -15,6 +15,8 @@ import (
 	"github.com/urfave/cli/v2"
 	"golang.org/x/term"
 	"gopkg.in/natefinch/lumberjack.v2"
+
+	"github.com/cloudflare/cloudflared/management"
 )
 
 const (
@@ -35,8 +37,15 @@ const (
 	consoleTimeFormat = time.RFC3339
 )
 
+var (
+	ManagementLogger *management.Logger
+)
+
 func init() {
+	zerolog.TimeFieldFormat = time.RFC3339
 	zerolog.TimestampFunc = utcNow
+
+	ManagementLogger = management.NewLogger()
 }
 
 func utcNow() time.Time {
@@ -50,16 +59,35 @@ func fallbackLogger(err error) *zerolog.Logger {
 	return &failLog
 }
 
-type resilientMultiWriter struct {
-	writers []io.Writer
-}
-
-// This custom resilientMultiWriter is an alternative to zerolog's so that we can make it resilient to individual
+// resilientMultiWriter is an alternative to zerolog's so that we can make it resilient to individual
 // writer's errors. E.g., when running as a Windows service, the console writer fails, but we don't want to
 // allow that to prevent all logging to fail due to breaking the for loop upon an error.
+type resilientMultiWriter struct {
+	level            zerolog.Level
+	writers          []io.Writer
+	managementWriter zerolog.LevelWriter
+}
+
 func (t resilientMultiWriter) Write(p []byte) (n int, err error) {
 	for _, w := range t.writers {
 		_, _ = w.Write(p)
+	}
+	if t.managementWriter != nil {
+		_, _ = t.managementWriter.Write(p)
+	}
+	return len(p), nil
+}
+
+func (t resilientMultiWriter) WriteLevel(level zerolog.Level, p []byte) (n int, err error) {
+	// Only write the event to normal writers if it exceeds the level, but always write to the
+	// management logger and let it decided with the provided level of the log event.
+	if t.level <= level {
+		for _, w := range t.writers {
+			_, _ = w.Write(p)
+		}
+	}
+	if t.managementWriter != nil {
+		_, _ = t.managementWriter.WriteLevel(level, p)
 	}
 	return len(p), nil
 }
@@ -91,13 +119,15 @@ func newZerolog(loggerConfig *Config) *zerolog.Logger {
 		writers = append(writers, rollingLogger)
 	}
 
-	multi := resilientMultiWriter{writers}
+	managementWriter := ManagementLogger
 
 	level, levelErr := zerolog.ParseLevel(loggerConfig.MinLevel)
 	if levelErr != nil {
 		level = zerolog.InfoLevel
 	}
-	log := zerolog.New(multi).With().Timestamp().Logger().Level(level)
+
+	multi := resilientMultiWriter{level, writers, managementWriter}
+	log := zerolog.New(multi).With().Timestamp().Logger()
 	if !levelErrorLogged && levelErr != nil {
 		log.Error().Msgf("Failed to parse log level %q, using %q instead", loggerConfig.MinLevel, level)
 		levelErrorLogged = true
@@ -137,7 +167,7 @@ func createFromContext(
 
 	log := newZerolog(loggerConfig)
 	if incompatibleFlagsSet := logFile != "" && logDirectory != ""; incompatibleFlagsSet {
-		log.Error().Msgf("Your config includes values for both %s and %s, but they are incompatible. %s takes precedence.", LogFileFlag, logDirectoryFlagName, LogFileFlag)
+		log.Error().Msgf("Your config includes values for both %s (%s) and %s (%s), but they are incompatible. %s takes precedence.", LogFileFlag, logFile, logDirectoryFlagName, logDirectory, LogFileFlag)
 	}
 	return log
 }

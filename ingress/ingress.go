@@ -7,18 +7,20 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog"
 	"github.com/urfave/cli/v2"
+	"golang.org/x/net/idna"
 
 	"github.com/cloudflare/cloudflared/config"
+	"github.com/cloudflare/cloudflared/ingress/middleware"
 	"github.com/cloudflare/cloudflared/ipaccess"
 )
 
 var (
 	ErrNoIngressRules             = errors.New("The config file doesn't contain any ingress rules")
+	ErrNoIngressRulesCLI          = errors.New("No ingress rules were defined in provided config (if any) nor from the cli, cloudflared will return 503 for all incoming HTTP requests")
 	errLastRuleNotCatchAll        = errors.New("The last ingress rule must match all URLs (i.e. it should not have a hostname or path filter)")
 	errBadWildcard                = errors.New("Hostname patterns can have at most one wildcard character (\"*\") and it can only be used for subdomains, e.g. \"*.example.com\"")
 	errHostnameContainsPort       = errors.New("Hostname cannot contain a port")
@@ -33,12 +35,21 @@ const (
 
 // FindMatchingRule returns the index of the Ingress Rule which matches the given
 // hostname and path. This function assumes the last rule matches everything,
-// which is the case if the rules were instantiated via the ingress#Validate method
+// which is the case if the rules were instantiated via the ingress#Validate method.
+//
+// Negative index rule signifies local cloudflared rules (not-user defined).
 func (ing Ingress) FindMatchingRule(hostname, path string) (*Rule, int) {
 	// The hostname might contain port. We only want to compare the host part with the rule
 	host, _, err := net.SplitHostPort(hostname)
 	if err == nil {
 		hostname = host
+	}
+	for i, rule := range ing.InternalRules {
+		if rule.Matches(hostname, path) {
+			// Local rule matches return a negative rule index to distiguish local rules from user-defined rules in logs
+			// Full range would be [-1 .. )
+			return &rule, -1 - i
+		}
 	}
 	for i, rule := range ing.Rules {
 		if rule.Matches(hostname, path) {
@@ -57,7 +68,7 @@ func matchHost(ruleHost, reqHost string) bool {
 
 	// Validate hostnames that use wildcards at the start
 	if strings.HasPrefix(ruleHost, "*.") {
-		toMatch := strings.TrimPrefix(ruleHost, "*.")
+		toMatch := strings.TrimPrefix(ruleHost, "*")
 		return strings.HasSuffix(reqHost, toMatch)
 	}
 	return false
@@ -65,21 +76,65 @@ func matchHost(ruleHost, reqHost string) bool {
 
 // Ingress maps eyeball requests to origins.
 type Ingress struct {
-	Rules    []Rule
-	defaults OriginRequestConfig
+	// Set of ingress rules that are not added to remote config, e.g. management
+	InternalRules []Rule
+	// Rules that are provided by the user from remote or local configuration
+	Rules    []Rule              `json:"ingress"`
+	Defaults OriginRequestConfig `json:"originRequest"`
 }
 
-// NewSingleOrigin constructs an Ingress set with only one rule, constructed from
-// legacy CLI parameters like --url or --no-chunked-encoding.
-func NewSingleOrigin(c *cli.Context, allowURLFromArgs bool) (Ingress, error) {
+// ParseIngress parses ingress rules, but does not send HTTP requests to the origins.
+func ParseIngress(conf *config.Configuration) (Ingress, error) {
+	if conf == nil || len(conf.Ingress) == 0 {
+		return Ingress{}, ErrNoIngressRules
+	}
+	return validateIngress(conf.Ingress, originRequestFromConfig(conf.OriginRequest))
+}
 
+// ParseIngressFromConfigAndCLI will parse the configuration rules from config files for ingress
+// rules and then attempt to parse CLI for ingress rules.
+// Will always return at least one valid ingress rule. If none are provided by the user, the default
+// will be to return 503 status code for all incoming requests.
+func ParseIngressFromConfigAndCLI(conf *config.Configuration, c *cli.Context, log *zerolog.Logger) (Ingress, error) {
+	// Attempt to parse ingress rules from configuration
+	ingressRules, err := ParseIngress(conf)
+	if err == nil && !ingressRules.IsEmpty() {
+		return ingressRules, nil
+	}
+	if err != ErrNoIngressRules {
+		return Ingress{}, err
+	}
+	// Attempt to parse ingress rules from CLI:
+	//   --url or --unix-socket flag for a tunnel HTTP ingress
+	//   --hello-world for a basic HTTP ingress self-served
+	//   --bastion for ssh bastion service
+	ingressRules, err = parseCLIIngress(c, false)
+	if errors.Is(err, ErrNoIngressRulesCLI) {
+		// If no token is provided, the probability of NOT being a remotely managed tunnel is higher.
+		// So, we should warn the user that no ingress rules were found, because remote configuration will most likely not exist.
+		if !c.IsSet("token") {
+			log.Warn().Msgf(ErrNoIngressRulesCLI.Error())
+		}
+		return newDefaultOrigin(c, log), nil
+	}
+
+	if err != nil {
+		return Ingress{}, err
+	}
+
+	return ingressRules, nil
+}
+
+// parseCLIIngress constructs an Ingress set with only one rule constructed from
+// CLI parameters: --url, --hello-world, --bastion, or --unix-socket
+func parseCLIIngress(c *cli.Context, allowURLFromArgs bool) (Ingress, error) {
 	service, err := parseSingleOriginService(c, allowURLFromArgs)
 	if err != nil {
 		return Ingress{}, err
 	}
 
 	// Construct an Ingress with the single rule.
-	defaults := originRequestFromSingeRule(c)
+	defaults := originRequestFromSingleRule(c)
 	ing := Ingress{
 		Rules: []Rule{
 			{
@@ -87,24 +142,26 @@ func NewSingleOrigin(c *cli.Context, allowURLFromArgs bool) (Ingress, error) {
 				Config:  setConfig(defaults, config.OriginRequestConfig{}),
 			},
 		},
-		defaults: defaults,
+		Defaults: defaults,
 	}
 	return ing, err
 }
 
-// WarpRoutingService starts a tcp stream between the origin and requests from
-// warp clients.
-type WarpRoutingService struct {
-	Proxy StreamBasedOriginProxy
-}
-
-func NewWarpRoutingService() *WarpRoutingService {
-	return &WarpRoutingService{Proxy: &rawTCPService{name: ServiceWarpRouting}}
+// newDefaultOrigin always returns a 503 response code to help indicate that there are no ingress
+// rules setup, but the tunnel is reachable.
+func newDefaultOrigin(c *cli.Context, log *zerolog.Logger) Ingress {
+	defaultRule := GetDefaultIngressRules(log)
+	defaults := originRequestFromSingleRule(c)
+	ingress := Ingress{
+		Rules:    defaultRule,
+		Defaults: defaults,
+	}
+	return ingress
 }
 
 // Get a single origin service from the CLI/config.
 func parseSingleOriginService(c *cli.Context, allowURLFromArgs bool) (OriginService, error) {
-	if c.IsSet("hello-world") {
+	if c.IsSet(HelloWorldFlag) {
 		return new(helloWorld), nil
 	}
 	if c.IsSet(config.BastionFlag) {
@@ -127,10 +184,9 @@ func parseSingleOriginService(c *cli.Context, allowURLFromArgs bool) (OriginServ
 		if err != nil {
 			return nil, errors.Wrap(err, "Error validating --unix-socket")
 		}
-		return &unixSocketPath{path: path}, nil
+		return &unixSocketPath{path: path, scheme: "http"}, nil
 	}
-	u, err := url.Parse("http://localhost:8080")
-	return &httpService{url: u}, err
+	return nil, ErrNoIngressRulesCLI
 }
 
 // IsEmpty checks if there are any ingress rules.
@@ -145,13 +201,11 @@ func (ing Ingress) IsSingleRule() bool {
 
 // StartOrigins will start any origin services managed by cloudflared, e.g. proxy servers or Hello World.
 func (ing Ingress) StartOrigins(
-	wg *sync.WaitGroup,
 	log *zerolog.Logger,
 	shutdownC <-chan struct{},
-	errC chan error,
 ) error {
 	for _, rule := range ing.Rules {
-		if err := rule.Service.start(wg, log, shutdownC, errC, rule.Config); err != nil {
+		if err := rule.Service.start(log, shutdownC, rule.Config); err != nil {
 			return errors.Wrapf(err, "Error starting local service %s", rule.Service)
 		}
 	}
@@ -163,7 +217,32 @@ func (ing Ingress) CatchAll() *Rule {
 	return &ing.Rules[len(ing.Rules)-1]
 }
 
-func validate(ingress []config.UnvalidatedIngressRule, defaults OriginRequestConfig) (Ingress, error) {
+// Gets the default ingress rule that will be return 503 status
+// code for all incoming requests.
+func GetDefaultIngressRules(log *zerolog.Logger) []Rule {
+	noRulesService := newDefaultStatusCode(log)
+	return []Rule{
+		{
+			Service: &noRulesService,
+		},
+	}
+}
+
+func validateAccessConfiguration(cfg *config.AccessConfig) error {
+	if !cfg.Required {
+		return nil
+	}
+
+	// we allow for an initial setup where user can force Access but not configure the rest of the keys.
+	// however, if the user specified audTags but forgot teamName, we should alert it.
+	if cfg.TeamName == "" && len(cfg.AudTag) > 0 {
+		return errors.New("access.TeamName cannot be blank when access.audTags are present")
+	}
+
+	return nil
+}
+
+func validateIngress(ingress []config.UnvalidatedIngressRule, defaults OriginRequestConfig) (Ingress, error) {
 	rules := make([]Rule, len(ingress))
 	for i, r := range ingress {
 		cfg := setConfig(defaults, r.OriginRequest)
@@ -172,15 +251,21 @@ func validate(ingress []config.UnvalidatedIngressRule, defaults OriginRequestCon
 		if prefix := "unix:"; strings.HasPrefix(r.Service, prefix) {
 			// No validation necessary for unix socket filepath services
 			path := strings.TrimPrefix(r.Service, prefix)
-			service = &unixSocketPath{path: path}
+			service = &unixSocketPath{path: path, scheme: "http"}
+		} else if prefix := "unix+tls:"; strings.HasPrefix(r.Service, prefix) {
+			path := strings.TrimPrefix(r.Service, prefix)
+			service = &unixSocketPath{path: path, scheme: "https"}
 		} else if prefix := "http_status:"; strings.HasPrefix(r.Service, prefix) {
-			status, err := strconv.Atoi(strings.TrimPrefix(r.Service, prefix))
+			statusCode, err := strconv.Atoi(strings.TrimPrefix(r.Service, prefix))
 			if err != nil {
-				return Ingress{}, errors.Wrap(err, "invalid HTTP status")
+				return Ingress{}, errors.Wrap(err, "invalid HTTP status code")
 			}
-			srv := newStatusCode(status)
+			if statusCode < 100 || statusCode > 999 {
+				return Ingress{}, fmt.Errorf("invalid HTTP status code: %d", statusCode)
+			}
+			srv := newStatusCode(statusCode)
 			service = &srv
-		} else if r.Service == "hello_world" || r.Service == "hello-world" || r.Service == "helloworld" {
+		} else if r.Service == HelloWorldFlag || r.Service == HelloWorldService {
 			service = new(helloWorld)
 		} else if r.Service == ServiceSocksProxy {
 			rules := make([]ipaccess.Rule, len(r.OriginRequest.IPRules))
@@ -226,27 +311,51 @@ func validate(ingress []config.UnvalidatedIngressRule, defaults OriginRequestCon
 			}
 		}
 
+		var handlers []middleware.Handler
+		if access := r.OriginRequest.Access; access != nil {
+			if err := validateAccessConfiguration(access); err != nil {
+				return Ingress{}, err
+			}
+			if access.Required {
+				verifier := middleware.NewJWTValidator(access.TeamName, "", access.AudTag)
+				handlers = append(handlers, verifier)
+			}
+		}
+
 		if err := validateHostname(r, i, len(ingress)); err != nil {
 			return Ingress{}, err
 		}
 
-		var pathRegex *regexp.Regexp
-		if r.Path != "" {
-			var err error
-			pathRegex, err = regexp.Compile(r.Path)
-			if err != nil {
-				return Ingress{}, errors.Wrapf(err, "Rule #%d has an invalid regex", i+1)
+		isCatchAllRule := (r.Hostname == "" || r.Hostname == "*") && r.Path == ""
+		punycodeHostname := ""
+		if !isCatchAllRule {
+			punycode, err := idna.Lookup.ToASCII(r.Hostname)
+			// Don't provide the punycode hostname if it is the same as the original hostname
+			if err == nil && punycode != r.Hostname {
+				punycodeHostname = punycode
 			}
 		}
 
+		var pathRegexp *Regexp
+		if r.Path != "" {
+			var err error
+			regex, err := regexp.Compile(r.Path)
+			if err != nil {
+				return Ingress{}, errors.Wrapf(err, "Rule #%d has an invalid regex", i+1)
+			}
+			pathRegexp = &Regexp{Regexp: regex}
+		}
+
 		rules[i] = Rule{
-			Hostname: r.Hostname,
-			Service:  service,
-			Path:     pathRegex,
-			Config:   cfg,
+			Hostname:         r.Hostname,
+			punycodeHostname: punycodeHostname,
+			Service:          service,
+			Path:             pathRegexp,
+			Handlers:         handlers,
+			Config:           cfg,
 		}
 	}
-	return Ingress{Rules: rules, defaults: defaults}, nil
+	return Ingress{Rules: rules, Defaults: defaults}, nil
 }
 
 func validateHostname(r config.UnvalidatedIngressRule, ruleIndex, totalRules int) error {
@@ -283,14 +392,6 @@ func (e errRuleShouldNotBeCatchAll) Error() string {
 	return fmt.Sprintf("Rule #%d is matching the hostname '%s', but "+
 		"this will match every hostname, meaning the rules which follow it "+
 		"will never be triggered.", e.index+1, e.hostname)
-}
-
-// ParseIngress parses ingress rules, but does not send HTTP requests to the origins.
-func ParseIngress(conf *config.Configuration) (Ingress, error) {
-	if len(conf.Ingress) == 0 {
-		return Ingress{}, ErrNoIngressRules
-	}
-	return validate(conf.Ingress, originRequestFromYAML(conf.OriginRequest))
 }
 
 func isHTTPService(url *url.URL) bool {
