@@ -11,10 +11,12 @@ import (
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog"
+	"github.com/stretchr/testify/assert"
 	"github.com/urfave/cli/v2"
 
 	"github.com/cloudflare/cloudflared/cfapi"
 	"github.com/cloudflare/cloudflared/connection"
+	"github.com/cloudflare/cloudflared/credentials"
 )
 
 type mockFileSystem struct {
@@ -34,10 +36,9 @@ func Test_subcommandContext_findCredentials(t *testing.T) {
 	type fields struct {
 		c                 *cli.Context
 		log               *zerolog.Logger
-		isUIEnabled       bool
 		fs                fileSystem
 		tunnelstoreClient cfapi.Client
-		userCredential    *userCredential
+		userCredential    *credentials.User
 	}
 	type args struct {
 		tunnelID uuid.UUID
@@ -115,7 +116,6 @@ func Test_subcommandContext_findCredentials(t *testing.T) {
 				AccountTag:   accountTag,
 				TunnelID:     tunnelID,
 				TunnelSecret: secret,
-				TunnelName:   name,
 			},
 		},
 		{
@@ -160,7 +160,6 @@ func Test_subcommandContext_findCredentials(t *testing.T) {
 				AccountTag:   accountTag,
 				TunnelID:     tunnelID,
 				TunnelSecret: secret,
-				TunnelName:   name,
 			},
 		},
 	}
@@ -169,7 +168,6 @@ func Test_subcommandContext_findCredentials(t *testing.T) {
 			sc := &subcommandContext{
 				c:                 tt.fields.c,
 				log:               tt.fields.log,
-				isUIEnabled:       tt.fields.isUIEnabled,
 				fs:                tt.fields.fs,
 				tunnelstoreClient: tt.fields.tunnelstoreClient,
 				userCredential:    tt.fields.userCredential,
@@ -217,7 +215,11 @@ func (d *deleteMockTunnelStore) GetTunnel(tunnelID uuid.UUID) (*cfapi.Tunnel, er
 	return &tunnel.tunnel, nil
 }
 
-func (d *deleteMockTunnelStore) DeleteTunnel(tunnelID uuid.UUID) error {
+func (d *deleteMockTunnelStore) GetTunnelToken(tunnelID uuid.UUID) (string, error) {
+	return "token", nil
+}
+
+func (d *deleteMockTunnelStore) DeleteTunnel(tunnelID uuid.UUID, cascade bool) error {
 	tunnel, ok := d.mockTunnels[tunnelID]
 	if !ok {
 		return fmt.Errorf("Couldn't find tunnel: %v", tunnelID)
@@ -248,7 +250,7 @@ func Test_subcommandContext_Delete(t *testing.T) {
 		isUIEnabled       bool
 		fs                fileSystem
 		tunnelstoreClient *deleteMockTunnelStore
-		userCredential    *userCredential
+		userCredential    *credentials.User
 	}
 	type args struct {
 		tunnelIDs []uuid.UUID
@@ -304,7 +306,6 @@ func Test_subcommandContext_Delete(t *testing.T) {
 			sc := &subcommandContext{
 				c:                 tt.fields.c,
 				log:               tt.fields.log,
-				isUIEnabled:       tt.fields.isUIEnabled,
 				fs:                tt.fields.fs,
 				tunnelstoreClient: tt.fields.tunnelstoreClient,
 				userCredential:    tt.fields.userCredential,
@@ -318,6 +319,51 @@ func Test_subcommandContext_Delete(t *testing.T) {
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("subcommandContext.findCredentials() = %v, want %v", got, tt.want)
 				return
+			}
+		})
+	}
+}
+
+func Test_subcommandContext_ValidateIngressCommand(t *testing.T) {
+	var tests = []struct {
+		name        string
+		c           *cli.Context
+		wantErr     bool
+		expectedErr error
+	}{
+		{
+			name: "read a valid configuration from data",
+			c: func() *cli.Context {
+				data := `{ "warp-routing": {"enabled": true},  "originRequest" : {"connectTimeout": 10}, "ingress" : [ {"hostname": "test", "service": "https://localhost:8000" } , {"service": "http_status:404"} ]}`
+				flagSet := flag.NewFlagSet("json", flag.PanicOnError)
+				flagSet.String(ingressDataJSONFlagName, data, "")
+				c := cli.NewContext(cli.NewApp(), flagSet, nil)
+				_ = c.Set(ingressDataJSONFlagName, data)
+				return c
+			}(),
+		},
+		{
+			name: "read an invalid configuration with multiple mistakes",
+			c: func() *cli.Context {
+				data := `{ "ingress" : [ {"hostname": "test", "service": "localhost:8000" } , {"service": "http_status:invalid_status"} ]}`
+				flagSet := flag.NewFlagSet("json", flag.PanicOnError)
+				flagSet.String(ingressDataJSONFlagName, data, "")
+				c := cli.NewContext(cli.NewApp(), flagSet, nil)
+				_ = c.Set(ingressDataJSONFlagName, data)
+				return c
+			}(),
+			wantErr:     true,
+			expectedErr: errors.New("Validation failed: localhost:8000 is an invalid address, please make sure it has a scheme and a hostname"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateIngressCommand(tt.c, "")
+			if tt.wantErr {
+				assert.Equal(t, tt.expectedErr.Error(), err.Error())
+			} else {
+				assert.Nil(t, err)
 			}
 		})
 	}

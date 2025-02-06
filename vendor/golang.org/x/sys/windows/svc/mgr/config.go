@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build windows
+//go:build windows
 
 package mgr
 
@@ -63,7 +63,7 @@ func toStringSlice(ps *uint16) []string {
 	return r
 }
 
-// Config retrieves service s configuration paramteres.
+// Config retrieves service s configuration parameters.
 func (s *Service) Config() (Config, error) {
 	var p *windows.QUERY_SERVICE_CONFIG
 	n := uint32(1024)

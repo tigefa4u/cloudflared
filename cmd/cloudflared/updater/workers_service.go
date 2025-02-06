@@ -3,6 +3,7 @@ package updater
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"runtime"
 )
@@ -56,6 +57,9 @@ func (s *WorkersService) Check() (CheckResult, error) {
 	}
 
 	req, err := http.NewRequest(http.MethodGet, s.url, nil)
+	if err != nil {
+		return nil, err
+	}
 	q := req.URL.Query()
 	q.Add(OSKeyName, runtime.GOOS)
 	q.Add(ArchitectureKeyName, runtime.GOARCH)
@@ -75,6 +79,10 @@ func (s *WorkersService) Check() (CheckResult, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("unable to check for update: %d", resp.StatusCode)
+	}
 
 	var v VersionResponse
 	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {

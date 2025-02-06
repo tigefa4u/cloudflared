@@ -2,7 +2,6 @@ package tunnel
 
 import (
 	"fmt"
-	"io/ioutil"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -14,13 +13,38 @@ import (
 
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/cliutil"
 	"github.com/cloudflare/cloudflared/config"
+	"github.com/cloudflare/cloudflared/credentials"
 	"github.com/cloudflare/cloudflared/logger"
 	"github.com/cloudflare/cloudflared/token"
 )
 
 const (
-	baseLoginURL     = "https://dash.cloudflare.com/argotunnel"
-	callbackStoreURL = "https://login.cloudflareaccess.org/"
+	baseLoginURL = "https://dash.cloudflare.com/argotunnel"
+	callbackURL  = "https://login.cloudflareaccess.org/"
+	// For now these are the same but will change in the future once we know which URLs to use (TUN-8872)
+	fedBaseLoginURL      = "https://dash.cloudflare.com/argotunnel"
+	fedCallbackStoreURL  = "https://login.cloudflareaccess.org/"
+	fedRAMPParamName     = "fedramp"
+	loginURLParamName    = "loginURL"
+	callbackURLParamName = "callbackURL"
+)
+
+var (
+	loginURL = &cli.StringFlag{
+		Name:  loginURLParamName,
+		Value: baseLoginURL,
+		Usage: "The URL used to login (default is https://dash.cloudflare.com/argotunnel)",
+	}
+	callbackStore = &cli.StringFlag{
+		Name:  callbackURLParamName,
+		Value: callbackURL,
+		Usage: "The URL used for the callback (default is https://login.cloudflareaccess.org/)",
+	}
+	fedramp = &cli.BoolFlag{
+		Name:    fedRAMPParamName,
+		Aliases: []string{"f"},
+		Usage:   "Login with FedRAMP High environment.",
+	}
 )
 
 func buildLoginSubcommand(hidden bool) *cli.Command {
@@ -30,6 +54,11 @@ func buildLoginSubcommand(hidden bool) *cli.Command {
 		Usage:     "Generate a configuration file with your login details",
 		ArgsUsage: " ",
 		Hidden:    hidden,
+		Flags: []cli.Flag{
+			loginURL,
+			callbackStore,
+			fedramp,
+		},
 	}
 }
 
@@ -44,14 +73,24 @@ func login(c *cli.Context) error {
 		return err
 	}
 
-	loginURL, err := url.Parse(baseLoginURL)
+	var (
+		baseloginURL     = c.String(loginURLParamName)
+		callbackStoreURL = c.String(callbackURLParamName)
+	)
+
+	if c.Bool(fedRAMPParamName) {
+		baseloginURL = fedBaseLoginURL
+		callbackStoreURL = fedCallbackStoreURL
+	}
+
+	loginURL, err := url.Parse(baseloginURL)
 	if err != nil {
-		// shouldn't happen, URL is hardcoded
 		return err
 	}
 
 	resourceData, err := token.RunTransfer(
 		loginURL,
+		"",
 		"cert",
 		"callback",
 		callbackStoreURL,
@@ -64,7 +103,7 @@ func login(c *cli.Context) error {
 		return err
 	}
 
-	if err := ioutil.WriteFile(path, resourceData, 0600); err != nil {
+	if err := os.WriteFile(path, resourceData, 0600); err != nil {
 		return errors.Wrap(err, fmt.Sprintf("error writing cert to %s", path))
 	}
 
@@ -85,7 +124,7 @@ func checkForExistingCert() (string, bool, error) {
 	if err != nil {
 		return "", false, err
 	}
-	path := filepath.Join(configPath, config.DefaultCredentialFile)
+	path := filepath.Join(configPath, credentials.DefaultCredentialFile)
 	fileInfo, err := os.Stat(path)
 	if err == nil && fileInfo.Size() > 0 {
 		return path, true, nil

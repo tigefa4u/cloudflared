@@ -5,9 +5,9 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
+	"path"
 	"text/template"
 
 	homedir "github.com/mitchellh/go-homedir"
@@ -43,16 +43,27 @@ func (st *ServiceTemplate) Generate(args *ServiceTemplateArgs) error {
 	if err != nil {
 		return err
 	}
+	if _, err = os.Stat(resolvedPath); err == nil {
+		return fmt.Errorf(serviceAlreadyExistsWarn(resolvedPath))
+	}
+
 	var buffer bytes.Buffer
 	err = tmpl.Execute(&buffer, args)
 	if err != nil {
 		return fmt.Errorf("error generating %s: %v", st.Path, err)
 	}
-	fileMode := os.FileMode(0644)
+	fileMode := os.FileMode(0o644)
 	if st.FileMode != 0 {
 		fileMode = st.FileMode
 	}
-	err = ioutil.WriteFile(resolvedPath, buffer.Bytes(), fileMode)
+
+	plistFolder := path.Dir(resolvedPath)
+	err = os.MkdirAll(plistFolder, 0o755)
+	if err != nil {
+		return fmt.Errorf("error creating %s: %v", plistFolder, err)
+	}
+
+	err = os.WriteFile(resolvedPath, buffer.Bytes(), fileMode)
 	if err != nil {
 		return fmt.Errorf("error writing %s: %v", resolvedPath, err)
 	}
@@ -71,6 +82,15 @@ func (st *ServiceTemplate) Remove() error {
 	return nil
 }
 
+func serviceAlreadyExistsWarn(service string) string {
+	return fmt.Sprintf("cloudflared service is already installed at %s; if you are running a cloudflared tunnel, you "+
+		"can point it to multiple origins, avoiding the need to run more than one cloudflared service in the "+
+		"same machine; otherwise if you are really sure, you can do `cloudflared service uninstall` to clean "+
+		"up the existing service and then try again this command",
+		service,
+	)
+}
+
 func runCommand(command string, args ...string) error {
 	cmd := exec.Command(command, args...)
 	stderr, err := cmd.StderrPipe()
@@ -82,10 +102,10 @@ func runCommand(command string, args ...string) error {
 		return fmt.Errorf("error starting %s: %v", command, err)
 	}
 
-	_, _ = ioutil.ReadAll(stderr)
+	output, _ := io.ReadAll(stderr)
 	err = cmd.Wait()
 	if err != nil {
-		return fmt.Errorf("%s returned with error: %v", command, err)
+		return fmt.Errorf("%s %v returned with error code %v due to: %v", command, args, err, string(output))
 	}
 	return nil
 }

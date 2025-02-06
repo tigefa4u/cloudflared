@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/urfave/cli/v2"
-	yaml "gopkg.in/yaml.v2"
+	yaml "gopkg.in/yaml.v3"
 
 	"github.com/cloudflare/cloudflared/config"
 	"github.com/cloudflare/cloudflared/ipaccess"
@@ -26,15 +26,33 @@ ingress:
 `
 	ing, err := ParseIngress(MustReadIngress(rawYAML))
 	require.NoError(t, err)
-	_, ok := ing.Rules[0].Service.(*unixSocketPath)
+	s, ok := ing.Rules[0].Service.(*unixSocketPath)
 	require.True(t, ok)
+	require.Equal(t, "http", s.scheme)
 }
 
-func Test_parseIngress(t *testing.T) {
+func TestParseUnixSocketTLS(t *testing.T) {
+	rawYAML := `
+ingress:
+- service: unix+tls:/tmp/echo.sock
+`
+	ing, err := ParseIngress(MustReadIngress(rawYAML))
+	require.NoError(t, err)
+	s, ok := ing.Rules[0].Service.(*unixSocketPath)
+	require.True(t, ok)
+	require.Equal(t, "https", s.scheme)
+}
+
+func TestParseIngressNilConfig(t *testing.T) {
+	_, err := ParseIngress(nil)
+	require.Error(t, err)
+}
+
+func TestParseIngress(t *testing.T) {
 	localhost8000 := MustParseURL(t, "https://localhost:8000")
 	localhost8001 := MustParseURL(t, "https://localhost:8001")
 	fourOhFour := newStatusCode(404)
-	defaultConfig := setConfig(originRequestFromYAML(config.OriginRequestConfig{}), config.OriginRequestConfig{})
+	defaultConfig := setConfig(originRequestFromConfig(config.OriginRequestConfig{}), config.OriginRequestConfig{})
 	require.Equal(t, defaultKeepAliveConnections, defaultConfig.KeepAliveConnections)
 	tr := true
 	type args struct {
@@ -118,6 +136,36 @@ ingress:
 			},
 		},
 		{
+			name: "Unicode domain",
+			args: args{rawYAML: `
+ingress:
+ - hostname: môô.cloudflare.com
+   service: https://localhost:8000
+ - service: https://localhost:8001
+`},
+			want: []Rule{
+				{
+					Hostname:         "môô.cloudflare.com",
+					punycodeHostname: "xn--m-xgaa.cloudflare.com",
+					Service:          &httpService{url: localhost8000},
+					Config:           defaultConfig,
+				},
+				{
+					Service: &httpService{url: localhost8001},
+					Config:  defaultConfig,
+				},
+			},
+		},
+		{
+			name: "Invalid unicode domain",
+			args: args{rawYAML: fmt.Sprintf(`
+ingress:
+ - hostname: %s
+   service: https://localhost:8000
+`, string(rune(0xd8f3))+".cloudflare.com")},
+			wantErr: true,
+		},
+		{
 			name: "Invalid service",
 			args: args{rawYAML: `
 ingress:
@@ -195,6 +243,14 @@ ingress:
 			args: args{rawYAML: `
 ingress:
  - service: http_status:asdf
+`},
+			wantErr: true,
+		},
+		{
+			name: "Invalid HTTP status code",
+			args: args{rawYAML: `
+ingress:
+ - service: http_status:8080
 `},
 			wantErr: true,
 		},
@@ -324,7 +380,17 @@ ingress:
 				{
 					Hostname: "socks.foo.com",
 					Service:  newSocksProxyOverWSService(accessPolicy()),
-					Config:   defaultConfig,
+					Config: setConfig(originRequestFromConfig(config.OriginRequestConfig{}), config.OriginRequestConfig{IPRules: []config.IngressIPRule{
+						{
+							Prefix: ipRulePrefix("1.1.1.0/24"),
+							Ports:  []int{80, 443},
+							Allow:  true,
+						},
+						{
+							Prefix: ipRulePrefix("0.0.0.0/0"),
+							Allow:  false,
+						},
+					}}),
 				},
 				{
 					Service: &fourOhFour,
@@ -345,7 +411,7 @@ ingress:
 				{
 					Hostname: "bastion.foo.com",
 					Service:  newBastionService(),
-					Config:   setConfig(originRequestFromYAML(config.OriginRequestConfig{}), config.OriginRequestConfig{BastionMode: &tr}),
+					Config:   setConfig(originRequestFromConfig(config.OriginRequestConfig{}), config.OriginRequestConfig{BastionMode: &tr}),
 				},
 				{
 					Service: &fourOhFour,
@@ -365,7 +431,7 @@ ingress:
 				{
 					Hostname: "bastion.foo.com",
 					Service:  newBastionService(),
-					Config:   setConfig(originRequestFromYAML(config.OriginRequestConfig{}), config.OriginRequestConfig{BastionMode: &tr}),
+					Config:   setConfig(originRequestFromConfig(config.OriginRequestConfig{}), config.OriginRequestConfig{BastionMode: &tr}),
 				},
 				{
 					Service: &fourOhFour,
@@ -395,6 +461,10 @@ ingress:
 			require.Equal(t, tt.want, got.Rules)
 		})
 	}
+}
+
+func ipRulePrefix(s string) *string {
+	return &s
 }
 
 func TestSingleOriginSetsConfig(t *testing.T) {
@@ -452,15 +522,15 @@ func TestSingleOriginSetsConfig(t *testing.T) {
 
 	allowURLFromArgs := false
 	require.NoError(t, err)
-	ingress, err := NewSingleOrigin(cliCtx, allowURLFromArgs)
+	ingress, err := parseCLIIngress(cliCtx, allowURLFromArgs)
 	require.NoError(t, err)
 
-	assert.Equal(t, time.Second, ingress.Rules[0].Config.ConnectTimeout)
-	assert.Equal(t, time.Second, ingress.Rules[0].Config.TLSTimeout)
-	assert.Equal(t, time.Second, ingress.Rules[0].Config.TCPKeepAlive)
+	assert.Equal(t, config.CustomDuration{Duration: time.Second}, ingress.Rules[0].Config.ConnectTimeout)
+	assert.Equal(t, config.CustomDuration{Duration: time.Second}, ingress.Rules[0].Config.TLSTimeout)
+	assert.Equal(t, config.CustomDuration{Duration: time.Second}, ingress.Rules[0].Config.TCPKeepAlive)
 	assert.True(t, ingress.Rules[0].Config.NoHappyEyeballs)
 	assert.Equal(t, 10, ingress.Rules[0].Config.KeepAliveConnections)
-	assert.Equal(t, time.Second, ingress.Rules[0].Config.KeepAliveTimeout)
+	assert.Equal(t, config.CustomDuration{Duration: time.Second}, ingress.Rules[0].Config.KeepAliveTimeout)
 	assert.Equal(t, "example.com:8080", ingress.Rules[0].Config.HTTPHostHeader)
 	assert.Equal(t, "example.com", ingress.Rules[0].Config.OriginServerName)
 	assert.Equal(t, "/etc/certs/ca.pem", ingress.Rules[0].Config.CAPool)
@@ -472,6 +542,119 @@ func TestSingleOriginSetsConfig(t *testing.T) {
 	assert.Equal(t, socksProxy, ingress.Rules[0].Config.ProxyType)
 }
 
+func TestSingleOriginServices(t *testing.T) {
+	host := "://localhost:8080"
+	httpURL := urlMustParse("http" + host)
+	tcpURL := urlMustParse("tcp" + host)
+	unix := "unix://service"
+	newCli := func(params ...string) *cli.Context {
+		flagSet := flag.NewFlagSet(t.Name(), flag.PanicOnError)
+		flagSet.Bool("hello-world", false, "")
+		flagSet.Bool("bastion", false, "")
+		flagSet.String("url", "", "")
+		flagSet.String("unix-socket", "", "")
+		cliCtx := cli.NewContext(cli.NewApp(), flagSet, nil)
+		for i := 0; i < len(params); i += 2 {
+			cliCtx.Set(params[i], params[i+1])
+		}
+
+		return cliCtx
+	}
+
+	tests := []struct {
+		name            string
+		cli             *cli.Context
+		expectedService OriginService
+		err             error
+	}{
+		{
+			name:            "Valid hello-world",
+			cli:             newCli("hello-world", "true"),
+			expectedService: &helloWorld{},
+		},
+		{
+			name:            "Valid bastion",
+			cli:             newCli("bastion", "true"),
+			expectedService: newBastionService(),
+		},
+		{
+			name:            "Valid http url",
+			cli:             newCli("url", httpURL.String()),
+			expectedService: &httpService{url: httpURL},
+		},
+		{
+			name:            "Valid tcp url",
+			cli:             newCli("url", tcpURL.String()),
+			expectedService: newTCPOverWSService(tcpURL),
+		},
+		{
+			name:            "Valid unix-socket",
+			cli:             newCli("unix-socket", unix),
+			expectedService: &unixSocketPath{path: unix, scheme: "http"},
+		},
+		{
+			name: "No origins defined",
+			cli:  newCli(),
+			err:  ErrNoIngressRulesCLI,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ingress, err := parseCLIIngress(test.cli, false)
+			require.Equal(t, err, test.err)
+			if test.err != nil {
+				return
+			}
+			require.Equal(t, 1, len(ingress.Rules))
+			rule := ingress.Rules[0]
+			require.Equal(t, test.expectedService, rule.Service)
+		})
+	}
+}
+
+func urlMustParse(s string) *url.URL {
+	u, err := url.Parse(s)
+	if err != nil {
+		panic(err)
+	}
+	return u
+}
+
+func TestSingleOriginServices_URL(t *testing.T) {
+	host := "://localhost:8080"
+	newCli := func(param string, value string) *cli.Context {
+		flagSet := flag.NewFlagSet(t.Name(), flag.PanicOnError)
+		flagSet.String("url", "", "")
+		cliCtx := cli.NewContext(cli.NewApp(), flagSet, nil)
+		cliCtx.Set(param, value)
+		return cliCtx
+	}
+
+	httpTests := []string{"http", "https"}
+	for _, test := range httpTests {
+		t.Run(test, func(t *testing.T) {
+			url := urlMustParse(test + host)
+			ingress, err := parseCLIIngress(newCli("url", url.String()), false)
+			require.NoError(t, err)
+			require.Equal(t, 1, len(ingress.Rules))
+			rule := ingress.Rules[0]
+			require.Equal(t, &httpService{url: url}, rule.Service)
+		})
+	}
+
+	tcpTests := []string{"ssh", "rdp", "smb", "tcp"}
+	for _, test := range tcpTests {
+		t.Run(test, func(t *testing.T) {
+			url := urlMustParse(test + host)
+			ingress, err := parseCLIIngress(newCli("url", url.String()), false)
+			require.NoError(t, err)
+			require.Equal(t, 1, len(ingress.Rules))
+			rule := ingress.Rules[0]
+			require.Equal(t, newTCPOverWSService(url), rule.Service)
+		})
+	}
+}
+
 func TestFindMatchingRule(t *testing.T) {
 	ingress := Ingress{
 		Rules: []Rule{
@@ -481,7 +664,7 @@ func TestFindMatchingRule(t *testing.T) {
 			},
 			{
 				Hostname: "tunnel-b.example.com",
-				Path:     mustParsePath(t, "/health"),
+				Path:     MustParsePath(t, "/health"),
 			},
 			{
 				Hostname: "*",
@@ -564,10 +747,10 @@ func TestIsHTTPService(t *testing.T) {
 	}
 }
 
-func mustParsePath(t *testing.T, path string) *regexp.Regexp {
+func MustParsePath(t *testing.T, path string) *Regexp {
 	regexp, err := regexp.Compile(path)
 	assert.NoError(t, err)
-	return regexp
+	return &Regexp{Regexp: regexp}
 }
 
 func MustParseURL(t *testing.T, rawURL string) *url.URL {
@@ -606,6 +789,46 @@ ingress:
 		ing.FindMatchingRule("tunnel1.example.com", "")
 		ing.FindMatchingRule("tunnel2.example.com", "")
 		ing.FindMatchingRule("tunnel3.example.com", "")
+	}
+}
+
+func TestParseAccessConfig(t *testing.T) {
+	tests := []struct {
+		name        string
+		cfg         config.AccessConfig
+		expectError bool
+	}{
+		{
+			name:        "Config required with teamName only",
+			cfg:         config.AccessConfig{Required: true, TeamName: "team"},
+			expectError: false,
+		},
+		{
+			name:        "required false",
+			cfg:         config.AccessConfig{Required: false},
+			expectError: false,
+		},
+		{
+			name:        "required true but empty config",
+			cfg:         config.AccessConfig{Required: true},
+			expectError: false,
+		},
+		{
+			name:        "complete config",
+			cfg:         config.AccessConfig{Required: true, TeamName: "team", AudTag: []string{"a"}},
+			expectError: false,
+		},
+		{
+			name:        "required true with audTags but no teamName",
+			cfg:         config.AccessConfig{Required: true, AudTag: []string{"a"}},
+			expectError: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateAccessConfiguration(&test.cfg)
+			require.Equal(t, err != nil, test.expectError)
+		})
 	}
 }
 

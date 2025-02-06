@@ -33,11 +33,17 @@ var (
 		Aliases: []string{"c"},
 		Usage:   "A new comment describing the purpose of the virtual network.",
 	}
+	vnetForceDeleteFlag = &cli.BoolFlag{
+		Name:    "force",
+		Aliases: []string{"f"},
+		Usage: "Force the deletion of the virtual network even if it is being relied upon by other resources. Those" +
+			"resources will either be deleted (e.g. IP Routes) or moved to the current default virutal network.",
+	}
 )
 
 func buildVirtualNetworkSubcommand(hidden bool) *cli.Command {
 	return &cli.Command{
-		Name:      "network",
+		Name:      "vnet",
 		Usage:     "Configure and query virtual networks to manage private IP routes with overlapping IPs.",
 		UsageText: "cloudflared tunnel [--config FILEPATH] network COMMAND [arguments...]",
 		Description: `cloudflared allows to manage IP routes that expose origins in your private network space via their IP directly
@@ -82,6 +88,7 @@ be the current default.`,
 				UsageText: "cloudflared tunnel [--config FILEPATH] network delete VIRTUAL_NETWORK",
 				Description: `Deletes the virtual network (given its ID or name). This is only possible if that virtual network is unused. 
 A virtual network may be used by IP routes or by WARP devices.`,
+				Flags:  []cli.Flag{vnetForceDeleteFlag},
 				Hidden: hidden,
 			},
 			{
@@ -177,7 +184,7 @@ func listVirtualNetworksCommand(c *cli.Context) error {
 	if len(vnets) > 0 {
 		formatAndPrintVnetsList(vnets)
 	} else {
-		fmt.Println("No virtual networks were found for the given filter flags. You can use 'cloudflared tunnel network add' to add a virtual network.")
+		fmt.Println("No virtual networks were found for the given filter flags. You can use 'cloudflared tunnel vnet add' to add a virtual network.")
 	}
 
 	return nil
@@ -188,7 +195,7 @@ func deleteVirtualNetworkCommand(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	if c.NArg() != 1 {
+	if c.NArg() < 1 {
 		return errors.New("You must supply exactly one argument, either the ID or name of the virtual network to delete")
 	}
 
@@ -198,7 +205,12 @@ func deleteVirtualNetworkCommand(c *cli.Context) error {
 		return err
 	}
 
-	if err := sc.deleteVirtualNetwork(vnetId); err != nil {
+	forceDelete := false
+	if c.IsSet(vnetForceDeleteFlag.Name) {
+		forceDelete = c.Bool(vnetForceDeleteFlag.Name)
+	}
+
+	if err := sc.deleteVirtualNetwork(vnetId, forceDelete); err != nil {
 		return errors.Wrap(err, "API error")
 	}
 	fmt.Printf("Successfully deleted virtual network '%s'\n", input)

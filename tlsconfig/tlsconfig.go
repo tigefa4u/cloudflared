@@ -5,22 +5,23 @@ package tlsconfig
 import (
 	"crypto/tls"
 	"crypto/x509"
-	"io/ioutil"
+	"os"
 
 	"github.com/pkg/errors"
 )
 
 // Config is the user provided parameters to create a tls.Config
 type TLSParameters struct {
-	Cert             string
-	Key              string
-	GetCertificate   *CertReloader
-	ClientCAs        []string
-	RootCAs          []string
-	ServerName       string
-	CurvePreferences []tls.CurveID
-	MinVersion       uint16 // min tls version. If zero, TLS1.0 is defined as minimum.
-	MaxVersion       uint16 // max tls version. If zero, last TLS version is used defined as limit (currently TLS1.3)
+	Cert                 string
+	Key                  string
+	GetCertificate       *CertReloader
+	GetClientCertificate *CertReloader
+	ClientCAs            []string
+	RootCAs              []string
+	ServerName           string
+	CurvePreferences     []tls.CurveID
+	MinVersion           uint16 // min tls version. If zero, TLS1.0 is defined as minimum.
+	MaxVersion           uint16 // max tls version. If zero, last TLS version is used defined as limit (currently TLS1.3)
 }
 
 // GetConfig returns a TLS configuration according to the Config set by the user.
@@ -41,6 +42,11 @@ func GetConfig(p *TLSParameters) (*tls.Config, error) {
 		// GetCertificate is called when client supplies SNI info or Certificates is empty.
 		// Order of retrieving certificate is GetCertificate, NameToCertificate and lastly first element of Certificates
 		tlsconfig.GetCertificate = p.GetCertificate.Cert
+	}
+
+	if p.GetClientCertificate != nil {
+		// GetClientCertificate is called when using an HTTP client library and mTLS is required.
+		tlsconfig.GetClientCertificate = p.GetClientCertificate.ClientCert
 	}
 
 	if len(p.ClientCAs) > 0 {
@@ -84,7 +90,7 @@ func GetConfig(p *TLSParameters) (*tls.Config, error) {
 func LoadCert(certPaths []string) (*x509.CertPool, error) {
 	ca := x509.NewCertPool()
 	for _, certPath := range certPaths {
-		caCert, err := ioutil.ReadFile(certPath)
+		caCert, err := os.ReadFile(certPath)
 		if err != nil {
 			return nil, errors.Wrapf(err, "Error reading certificate %s", certPath)
 		}

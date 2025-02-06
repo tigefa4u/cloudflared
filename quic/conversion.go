@@ -4,19 +4,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/lucas-clemente/quic-go/logging"
+	"github.com/quic-go/quic-go/logging"
 )
-
-func perspectiveString(p logging.Perspective) string {
-	switch p {
-	case logging.PerspectiveClient:
-		return "client"
-	case logging.PerspectiveServer:
-		return "server"
-	default:
-		return ""
-	}
-}
 
 // Helper to convert logging.ByteCount(alias for int64) to float64 used in prometheus
 func byteCountToPromCount(count logging.ByteCount) float64 {
@@ -28,7 +17,7 @@ func durationToPromGauge(duration time.Duration) float64 {
 	return float64(duration.Milliseconds())
 }
 
-// Helper to convert https://pkg.go.dev/github.com/lucas-clemente/quic-go@v0.23.0/logging#PacketType into string
+// Helper to convert https://pkg.go.dev/github.com/quic-go/quic-go@v0.23.0/logging#PacketType into string
 func packetTypeString(pt logging.PacketType) string {
 	switch pt {
 	case logging.PacketTypeInitial:
@@ -52,7 +41,7 @@ func packetTypeString(pt logging.PacketType) string {
 	}
 }
 
-// Helper to convert https://pkg.go.dev/github.com/lucas-clemente/quic-go@v0.23.0/logging#PacketDropReason into string
+// Helper to convert https://pkg.go.dev/github.com/quic-go/quic-go@v0.23.0/logging#PacketDropReason into string
 func packetDropReasonString(reason logging.PacketDropReason) string {
 	switch reason {
 	case logging.PacketDropKeyUnavailable:
@@ -82,7 +71,7 @@ func packetDropReasonString(reason logging.PacketDropReason) string {
 	}
 }
 
-// Helper to convert https://pkg.go.dev/github.com/lucas-clemente/quic-go@v0.23.0/logging#PacketLossReason into string
+// Helper to convert https://pkg.go.dev/github.com/quic-go/quic-go@v0.23.0/logging#PacketLossReason into string
 func packetLossReasonString(reason logging.PacketLossReason) string {
 	switch reason {
 	case logging.PacketLossReorderingThreshold:

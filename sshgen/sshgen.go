@@ -10,12 +10,13 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
+	"os"
 	"time"
 
-	"github.com/coreos/go-oidc/jose"
+	"github.com/go-jose/go-jose/v4"
+	"github.com/go-jose/go-jose/v4/jwt"
 	homedir "github.com/mitchellh/go-homedir"
 	"github.com/pkg/errors"
 	gossh "golang.org/x/crypto/ssh"
@@ -50,6 +51,8 @@ type errorResponse struct {
 }
 
 var mockRequest func(url, contentType string, body io.Reader) (*http.Response, error) = nil
+
+var signatureAlgs = []jose.SignatureAlgorithm{jose.RS256}
 
 // GenerateShortLivedCertificate generates and stores a keypair for short lived certs
 func GenerateShortLivedCertificate(appURL *url.URL, token string) error {
@@ -87,37 +90,33 @@ func SignCert(token, pubKey string) (string, error) {
 		return "", errors.New("invalid token")
 	}
 
-	jwt, err := jose.ParseJWT(token)
+	parsedToken, err := jwt.ParseSigned(token, signatureAlgs)
 	if err != nil {
 		return "", errors.Wrap(err, "failed to parse JWT")
 	}
 
-	claims, err := jwt.Claims()
+	claims := jwt.Claims{}
+	err = parsedToken.UnsafeClaimsWithoutVerification(&claims)
 	if err != nil {
 		return "", errors.Wrap(err, "failed to retrieve JWT claims")
-	}
-
-	issuer, _, err := claims.StringClaim("iss")
-	if err != nil {
-		return "", errors.Wrap(err, "failed to retrieve JWT iss")
 	}
 
 	buf, err := json.Marshal(&signPayload{
 		PublicKey: pubKey,
 		JWT:       token,
-		Issuer:    issuer,
+		Issuer:    claims.Issuer,
 	})
 	if err != nil {
 		return "", errors.Wrap(err, "failed to marshal signPayload")
 	}
 	var res *http.Response
 	if mockRequest != nil {
-		res, err = mockRequest(issuer+signEndpoint, "application/json", bytes.NewBuffer(buf))
+		res, err = mockRequest(claims.Issuer+signEndpoint, "application/json", bytes.NewBuffer(buf))
 	} else {
 		client := http.Client{
 			Timeout: 10 * time.Second,
 		}
-		res, err = client.Post(issuer+signEndpoint, "application/json", bytes.NewBuffer(buf))
+		res, err = client.Post(claims.Issuer+signEndpoint, "application/json", bytes.NewBuffer(buf))
 	}
 
 	if err != nil {
@@ -152,7 +151,7 @@ func generateKeyPair(fullName string) ([]byte, error) {
 		return nil, err
 	}
 	if exist {
-		return ioutil.ReadFile(pubKeyName)
+		return os.ReadFile(pubKeyName)
 	}
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -191,5 +190,5 @@ func writeKey(filename string, data []byte) error {
 		return err
 	}
 
-	return ioutil.WriteFile(filepath, data, 0600)
+	return os.WriteFile(filepath, data, 0600)
 }

@@ -2,7 +2,6 @@ package connection
 
 import (
 	"github.com/cloudflare/cloudflared/edgediscovery"
-	"github.com/cloudflare/cloudflared/h2mux"
 	tunnelpogs "github.com/cloudflare/cloudflared/tunnelrpc/pogs"
 )
 
@@ -16,6 +15,19 @@ var errDuplicationConnection = DupConnRegisterTunnelError{}
 
 func (e DupConnRegisterTunnelError) Error() string {
 	return "already connected to this server, trying another address"
+}
+
+// Dial to edge server with quic failed
+type EdgeQuicDialError struct {
+	Cause error
+}
+
+func (e *EdgeQuicDialError) Error() string {
+	return "failed to dial to edge with quic: " + e.Cause.Error()
+}
+
+func (e *EdgeQuicDialError) Unwrap() error {
+	return e.Cause
 }
 
 // RegisterTunnel error from server
@@ -58,8 +70,6 @@ func isHandshakeErrRecoverable(err error, connIndex uint8, observer *Observer) b
 	switch err.(type) {
 	case edgediscovery.DialError:
 		log.Error().Msg("Connection unable to dial edge")
-	case h2mux.MuxerHandshakeError:
-		log.Error().Msg("Connection handshake with edge server failed")
 	default:
 		log.Error().Msg("Connection failed")
 		return false

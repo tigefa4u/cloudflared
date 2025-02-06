@@ -9,18 +9,22 @@ import (
 	"github.com/pkg/errors"
 )
 
-// DialEdgeWithH2Mux makes a TLS connection to a Cloudflare edge node
+// DialEdge makes a TLS connection to a Cloudflare edge node
 func DialEdge(
 	ctx context.Context,
 	timeout time.Duration,
 	tlsConfig *tls.Config,
 	edgeTCPAddr *net.TCPAddr,
+	localIP net.IP,
 ) (net.Conn, error) {
 	// Inherit from parent context so we can cancel (Ctrl-C) while dialing
 	dialCtx, dialCancel := context.WithTimeout(ctx, timeout)
 	defer dialCancel()
 
 	dialer := net.Dialer{}
+	if localIP != nil {
+		dialer.LocalAddr = &net.TCPAddr{IP: localIP, Port: 0}
+	}
 	edgeConn, err := dialer.DialContext(dialCtx, "tcp", edgeTCPAddr.String())
 	if err != nil {
 		return nil, newDialError(err, "DialContext error")
@@ -32,7 +36,7 @@ func DialEdge(
 	if err = tlsEdgeConn.Handshake(); err != nil {
 		return nil, newDialError(err, "TLS handshake with edge error")
 	}
-	// clear the deadline on the conn; h2mux has its own timeouts
+	// clear the deadline on the conn; http2 has its own timeouts
 	tlsEdgeConn.SetDeadline(time.Time{})
 	return tlsEdgeConn, nil
 }
